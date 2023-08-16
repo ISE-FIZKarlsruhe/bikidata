@@ -1,6 +1,6 @@
 # Bikidata
 
-Queries over Wikidata dumps.
+Queries over Wikidata dumps. Some background info [in these slides](FIZ-ISE_seminar_20230816.pdf).
 
 Wikidata is an invaluable resource in our research activities. But in many cases we need to do complex queries, or extract large swathes of data. This is an example on how we can convert [offline dumps of Wikidata](https://www.mediawiki.org/wiki/Wikibase/Indexing/RDF_Dump_Format) into a format that we can query in a structured manner, or run extractions on.
 
