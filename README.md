@@ -44,7 +44,8 @@ Or the example from Harald, to find similar items to the above book:
 
 ```SQL
 WITH Q53592_po AS (SELECT p,o FROM 'xa?.parquet' WHERE s = 12746726515823639617)
-SELECT p_cnt, (SELECT iri FROM 'index.parquet' WHERE hash = s) FROM (SELECT t.s, count(t.p) p_cnt FROM 'xa?.parquet' t
+SELECT p_cnt, (SELECT iri FROM 'index.parquet' WHERE hash = s)
+  FROM (SELECT t.s, count(t.p) p_cnt FROM 'xa?.parquet' t
    INNER JOIN Q53592_po ON t.p = Q53592_po.p AND t.o = Q53592_po.o
    GROUP BY t.s
    ORDER BY count(t.p) DESC)
