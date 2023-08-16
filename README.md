@@ -40,7 +40,7 @@ select * from 'index.parquet' where hash = 12746726515823639617;
    <http://www.wikidata.org/entity/Q53592>
 ```
 
-Or the example from Harald, to find similar items to the above book:
+Or the request from [Q30078997](https://www.wikidata.org/wiki/Q30078997), to find similar items to the above book:
 
 ```SQL
 WITH Q53592_po AS (SELECT p,o FROM 'xa?.parquet' WHERE s = 12746726515823639617)
@@ -51,3 +51,17 @@ SELECT p_cnt, (SELECT iri FROM 'index.parquet' WHERE hash = s)
    ORDER BY count(t.p) DESC)
 WHERE p_cnt > 10;
 ```
+
+which is an interpretation of:
+
+```sparql
+SELECT ?book (COUNT(DISTINCT ?o) as ?score)
+WHERE {
+  wd:Q53592 ?p ?o .
+  ?book wdt:P31 wd:Q571 ;
+        ?p ?o .
+} GROUP BY ?book
+ORDER BY DESC(?score)
+```
+
+(which has a timeout when you run it on the [WDQS](https://query.wikidata.org/))
