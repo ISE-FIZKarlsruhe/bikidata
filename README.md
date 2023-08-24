@@ -65,3 +65,14 @@ ORDER BY DESC(?score)
 ```
 
 (which has a timeout when you run it on the [WDQS](https://query.wikidata.org/))
+
+## TODO List
+
+- [ ] Sort the tri table to improve speed of queries. Solve OOM problem, sort has to be on-disk.
+- [ ] Make smaller extracts, like (P31 Q5)
+- [ ] A quick Property lookup, with labels
+- [ ] A "labels" service
+- [ ] A bikidata package on PYPI
+- [ ] Index literals using embeddings and a HNSW (SBERT + FAIS?)
+- [ ] Make a fast membership index for the large P31 sets using a Bloomfilter, and add it as a UDF to bikidata package
+- [ ] Add a SPARQL translation engine  🤓 Hah, ambitious.
