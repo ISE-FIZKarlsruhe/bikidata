@@ -15,9 +15,11 @@ if os.path.exists("map.parquet"):
     print("Reading existing map.parquet")
     df = fastparquet.ParquetFile("map.parquet").to_pandas(["literal"])
     print("Seeding bloomfilter... ", end="")
+    count = 0
     for row in df.values:
         bf.add(row[0])
-    print("done")
+        count += 1
+    print(f"done, {count} items in Bloomfilter")
 
 
 def add_if_not_seen(buf, val):
@@ -31,7 +33,7 @@ def add_buf(df, buf):
     new_row = pd.DataFrame(
         {
             "hash": pd.Series([a for a, _ in buf], dtype="uint64"),
-            mode: pd.Series([a for _, a in buf], dtype="str"),
+            "literal": pd.Series([a for _, a in buf], dtype="str"),
         }
     )
     return pd.concat([df, new_row], ignore_index=True), []
@@ -45,7 +47,7 @@ def main():
         {"hash": pd.Series([], dtype="uint64"), "literal": pd.Series([], dtype="str")}
     )
 
-    with open(sys.argv[2]) as F:
+    with open(sys.argv[1]) as F:
         buf = []
         line = True
         line_no = 0
@@ -56,6 +58,7 @@ def main():
                 break
             line = line.strip()
             if not line.endswith(" ."):
+                line = True
                 continue
             line = line[:-2]
             parts = line.split(" ")
@@ -88,7 +91,7 @@ def main():
 
     df, _ = add_buf(df, buf)
     print(
-        time.ctime(), int((time.time() - start_time) / 60), "min", df.shape, sys.argv[2]
+        time.ctime(), int((time.time() - start_time) / 60), "min", df.shape, sys.argv[1]
     )
     try:
         fastparquet.write(
