@@ -11,14 +11,9 @@ DURATION_LIMIT = 10  # in seconds
 BUF_LIMIT = 1000000
 bf = Bloom(LINECOUNT, 0.01)
 
-mode = "literal"
-if sys.argv[1] == "index":
-    mode = "iri"
-
-
-if os.path.exists(f"{mode}.parquet"):
-    print(f"{sys.argv[2]} Reading existing {mode}.parquet")
-    df = fastparquet.ParquetFile(f"{mode}.parquet").to_pandas([mode])
+if os.path.exists("map.parquet"):
+    print("Reading existing map.parquet")
+    df = fastparquet.ParquetFile("map.parquet").to_pandas(["literal"])
     print("Seeding bloomfilter... ", end="")
     for row in df.values:
         bf.add(row[0])
@@ -47,7 +42,7 @@ def main():
     chunk_time = start_time
 
     df = pd.DataFrame(
-        {"hash": pd.Series([], dtype="uint64"), mode: pd.Series([], dtype="str")}
+        {"hash": pd.Series([], dtype="uint64"), "literal": pd.Series([], dtype="str")}
     )
 
     with open(sys.argv[2]) as F:
@@ -69,15 +64,11 @@ def main():
             s = parts[0]
             p = parts[1]
             o = " ".join(parts[2:])
-            if mode == "iri":
-                add_if_not_seen(buf, s)
-                add_if_not_seen(buf, p)
-            if o[0] == "<":
-                if mode == "iri":
-                    add_if_not_seen(buf, o)
-            else:
-                if mode == "literal":
-                    add_if_not_seen(buf, o)
+
+            add_if_not_seen(buf, s)
+            add_if_not_seen(buf, p)
+            add_if_not_seen(buf, o)
+
             if len(buf) > BUF_LIMIT:
                 df, buf = add_buf(df, buf)
             loop_time = time.time()
@@ -96,12 +87,14 @@ def main():
                 chunk_time = time.time()
 
     df, _ = add_buf(df, buf)
-    print(time.ctime(), int((time.time() - start_time) / 60), "min", df.shape, sys.argv[2])
+    print(
+        time.ctime(), int((time.time() - start_time) / 60), "min", df.shape, sys.argv[2]
+    )
     try:
         fastparquet.write(
-            f"{mode}.parquet",
+            "map.parquet",
             df,
-            append=os.path.exists(f"{mode}.parquet"),
+            append=os.path.exists("map.parquet"),
             compression={"_default": {"type": "GZIP", "args": None}},
         )
     except:
