@@ -68,6 +68,7 @@ ORDER BY DESC(?score)
 
 ## TODO List
 
+- [ ] Add some explanation on: "Why not just use HDT?"
 - [ ] Sort the tri table to improve speed of queries. Solve OOM problem, sort has to be on-disk.
 - [ ] Make smaller extracts, like (P31 Q5)
 - [ ] A quick Property lookup, with labels
@@ -76,3 +77,7 @@ ORDER BY DESC(?score)
 - [ ] Index literals using embeddings and a HNSW (SBERT + FAIS?)
 - [ ] Make a fast membership index for the large P31 sets using a Bloomfilter, and add it as a UDF to bikidata package
 - [ ] Add a SPARQL translation engine  🤓 Hah, ambitious.
+
+## Also see
+
+[qEndpoint for Wikidata](https://github.com/the-qa-company/qEndpoint#qacompanyqendpoint-wikidata)
