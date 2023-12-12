@@ -73,11 +73,13 @@ ORDER BY DESC(?score)
 - [ ] Make smaller extracts, like (P31 Q5)
 - [ ] A quick Property lookup, with labels
 - [ ] A "labels" service
-- [ ] A bikidata package on PYPI
+- [x] A bikidata package on PYPI
 - [ ] Index literals using embeddings and a HNSW (SBERT + FAIS?)
 - [ ] Make a fast membership index for the large P31 sets using a Bloomfilter, and add it as a UDF to bikidata package
-- [ ] Add a SPARQL translation engine  🤓 Hah, ambitious.
+- [ ] Add a SPARQL translation engine 🤓 Hah, ambitious.
 
 ## Also see
 
 [qEndpoint for Wikidata](https://github.com/the-qa-company/qEndpoint#qacompanyqendpoint-wikidata)
+
+[Triplestore Benchmarks for Wikidata](https://github.com/SINTEF-9012/rdf-triplestore-benchmark/tree/main/Queries/wikidata_queries)
