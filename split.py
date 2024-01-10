@@ -8,8 +8,7 @@ import sys
 from typing import List, Tuple
 
 """
-Split an existing parquet file into smaller chunks based on 
-a specific where clause.
+Split an existing parquet file into subfiles based on a specified key and resolution.
 """
 
 
@@ -53,6 +52,9 @@ def parse_arguments(arguments: List[str]) -> Tuple[str, str, str, int]:
         raise ValueError(
             "The source file path has to point to an existing parquet file."
         )
+
+    if digits < 1:
+        raise ValueError("The digits argument has to be a positive integer.")
 
     return source_path, target_dir, key, digits
 
