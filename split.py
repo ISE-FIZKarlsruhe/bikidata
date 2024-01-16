@@ -118,6 +118,8 @@ def main():
         if len(value_df) == 0:
             continue
 
+        value_df = value_df.sort_values(by=[key], ascending=True)
+
         target_path = f"{target_dir}/{source_file_name.replace('.parquet', '_' + str(i) + '.parquet')}"
         value_df.to_parquet(target_path)
 
