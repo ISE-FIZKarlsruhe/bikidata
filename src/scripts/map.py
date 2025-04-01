@@ -52,8 +52,13 @@ def main():
         line = True
         line_no = 0
         while line:
-            line = F.readline()
             line_no += 1
+            try:
+                line = F.readline()
+            except:
+                print("###### ", line_no)
+                traceback.print_exc()
+                continue
             if not line:
                 break
             line = line.strip()

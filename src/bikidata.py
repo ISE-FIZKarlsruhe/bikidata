@@ -126,6 +126,10 @@ def build_bikidata(
         log.error("No triples to index, triplefile_paths not given")
         return
 
+    if os.path.exists(DB_PATH):
+        log.error(f"The database {DB_PATH} already exists")
+        return
+
     TRIPLE_PATH = os.getenv("BIKIDATA_TRIPLE_PATH", "triples")
     MAP_PATH = os.getenv("BIKIDATA_MAP_PATH", "maps")
 
