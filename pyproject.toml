@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "bikidata"
+version = "0.2.5"
+description = "Developer-friendly Queries over RDF triples "
+authors = ["Etienne Posthumus <ep@epoz.org>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
+repository = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
+keywords = ["search", "RDF", "Linked Data"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+duckdb = "^1.2.0"
+numpy = "^2.2.4"
+xxhash = "^3.5.0"
+pandas = "^2.2.3"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
