@@ -43,6 +43,9 @@ or
 ```python
 r = bikidata.query({
     "filters": [
+        {"p":"fts",
+         "o":"something"
+        },
         { "op":"not",
           "p":"<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
           "o":"<https://swapi.co/vocabulary/Species>"
