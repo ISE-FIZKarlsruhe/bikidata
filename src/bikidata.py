@@ -2,11 +2,14 @@ import sys, logging, gzip, re, os
 import duckdb
 import xxhash
 
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+
 log = logging.getLogger("bikidata")
 handler = logging.StreamHandler()
 log.addHandler(handler)
-log.setLevel(logging.DEBUG)
-handler.setLevel(logging.DEBUG)
+if DEBUG:
+    log.setLevel(logging.DEBUG)
+    handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter(
     "%(levelname)-9s %(name)s %(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -14,7 +17,6 @@ handler.setFormatter(formatter)
 
 DB_PATH = os.getenv("BIKIDATA_DB", "bikidata.duckdb")
 log.debug(f"BIKIDATA_DB is configured as {DB_PATH}")
-DB = duckdb.connect(DB_PATH)
 
 
 def literal_to_parts(literal: str):
@@ -126,9 +128,14 @@ def build_bikidata(
         log.error("No triples to index, triplefile_paths not given")
         return
 
-    if os.path.exists(DB_PATH):
-        log.error(f"The database {DB_PATH} already exists")
+    DB = duckdb.connect(DB_PATH)
+
+    try:
+        DB.execute("select count(*) from triples").fetchall()
+        log.debug(f"The database [{DB_PATH}] already exists, doing nothing")
         return
+    except duckdb.CatalogException:
+        log.debug("The database is still empty, creating tables")
 
     TRIPLE_PATH = os.getenv("BIKIDATA_TRIPLE_PATH", "triples")
     MAP_PATH = os.getenv("BIKIDATA_MAP_PATH", "maps")
@@ -168,17 +175,22 @@ def build_bikidata(
         rf"insert into triples(s,p,o,g) select ('0x' || column0).lower()::ubigint, ('0x' || column1).lower()::ubigint, ('0x' || column2).lower()::ubigint, ('0x' || column3).lower()::ubigint from read_csv('{TRIPLE_PATH}', delim='\t', header=false)"
     )
     DB.execute(
-        rf"""insert into literals select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000) where substr(column1, 1, 1) = '"' group by column0 order by column0 """
+        rf"""insert into literals select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) = '"' group by column0 order by column0 """
     )
 
     DB.execute(
-        rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000) where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
+        rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
     DB.execute("pragma create_fts_index('literals', 'hash', 'value')")
     DB.commit()
 
     os.unlink(TRIPLE_PATH)
     os.unlink(MAP_PATH)
+
+
+####################################################################################
+####################################################################################
+####################################################################################
 
 
 def q_to_sql(query: dict):
@@ -201,13 +213,14 @@ def q_to_sql(query: dict):
     elif p == "id":
         if o.startswith("random") or o.startswith("sample"):
             o_split = o.split(" ")
+            o_count = 1
             if len(o_split) > 1:
                 o = o_split[0]
                 try:
                     o_count = int(o_split[1])
                 except ValueError:
                     o_count = 1
-            f"(select distinct s from triples using sample {o_count} {extra_g})"
+            return f"(select distinct s from triples using sample {o_count} {extra_g})"
         return f"(select distinct s from triples where s = '0x{oo}'::ubigint {extra_g})"
 
     elif p.startswith("fts"):
@@ -262,6 +275,7 @@ def query(opts):
             elif op == "not":
                 queries.append(" EXCEPT " + q_to_sql(query))
 
+    DB = duckdb.connect(DB_PATH)
     total = 0
     tofetch = set()
     results = {}
