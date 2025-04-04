@@ -17,6 +17,13 @@ handler.setFormatter(formatter)
 
 DB_PATH = os.getenv("BIKIDATA_DB", "bikidata.duckdb")
 log.debug(f"BIKIDATA_DB is configured as {DB_PATH}")
+DB = duckdb.connect(DB_PATH)
+
+try:
+    triple_count = DB.execute("select count(*) from triples").fetchall()
+    print(f"Triples in DB: {triple_count[0][0]}")
+except duckdb.CatalogException:
+    log.debug("The database is still empty")
 
 
 def literal_to_parts(literal: str):
@@ -120,6 +127,7 @@ def H(v: str):
 
 def build_bikidata(
     triplefile_paths: list,
+    db_connection: duckdb.DuckDBPyConnection,
 ):
     if len(triplefile_paths) > 0:
         log.debug(f"Building Bikidata index with {triplefile_paths}")
@@ -128,14 +136,13 @@ def build_bikidata(
         log.error("No triples to index, triplefile_paths not given")
         return
 
-    DB = duckdb.connect(DB_PATH)
-
     try:
-        DB.execute("select count(*) from triples").fetchall()
-        log.debug(f"The database [{DB_PATH}] already exists, doing nothing")
-        return
+        triple_count = db_connection.execute("select count(*) from triples").fetchall()
+        if triple_count[0][0] > 0:
+            log.debug(f"The database [{DB_PATH}] already has data, doing nothing")
+            return
     except duckdb.CatalogException:
-        log.debug("The database is still empty, creating tables")
+        log.debug("No triples in database yet")
 
     TRIPLE_PATH = os.getenv("BIKIDATA_TRIPLE_PATH", "triples")
     MAP_PATH = os.getenv("BIKIDATA_MAP_PATH", "maps")
@@ -147,15 +154,24 @@ def build_bikidata(
 
     all_graphs = set()
     for s, p, o, g in iterator:
-        ss = H(s)
-        pp = H(p)
-        oo = H(o)
-        gg = H(g)
-        all_graphs.add(g)
-        TRIPLE_OUT_FILE.write(f"{ss}\t{pp}\t{oo}\t{gg}\n")
-        MAP_OUT_FILE.write(f"{ss}\t|\t{s}\n")
-        MAP_OUT_FILE.write(f"{pp}\t|\t{p}\n")
-        MAP_OUT_FILE.write(f"{oo}\t|\t{o}\n")
+        try:
+            ss = H(s)
+            pp = H(p)
+            oo = H(o)
+            gg = H(g)
+            all_graphs.add(g)
+            TRIPLE_OUT_FILE.write(f"{ss}\t{pp}\t{oo}\t{gg}\n")
+            MAP_OUT_FILE.write(f"{ss}\t|\t{s}\n")
+            MAP_OUT_FILE.write(f"{pp}\t|\t{p}\n")
+            MAP_OUT_FILE.write(f"{oo}\t|\t{o}\n")
+        except UnicodeEncodeError as e:
+            log.error(f"Error hashing {e}")
+            continue
+            # Certain strings can casues errors, especially emojis encoded in JSON
+            # For example, "\ud83d\ude09" is how the smiley gets encoded in JSON (as a Javascript string)
+            # If you try to treat this as a UTF-8 string it throws an error.
+            # json.loads(r'"\ud83d\ude09"') <- this works
+            # "\ud83d\ude09".encode('utf8') <- this throws an error
     for g in all_graphs:
         gg = H(g)
         MAP_OUT_FILE.write(f"{gg}\t|\t{g}\n")
@@ -169,20 +185,19 @@ def build_bikidata(
     create table if not exists triples (s ubigint, p ubigint, o ubigint, g ubigint);    
     """
 
-    DB = duckdb.connect(DB_PATH)
-    DB.execute(DB_SCHEMA)
-    DB.execute(
+    db_connection.execute(DB_SCHEMA)
+    db_connection.execute(
         rf"insert into triples(s,p,o,g) select ('0x' || column0).lower()::ubigint, ('0x' || column1).lower()::ubigint, ('0x' || column2).lower()::ubigint, ('0x' || column3).lower()::ubigint from read_csv('{TRIPLE_PATH}', delim='\t', header=false)"
     )
-    DB.execute(
+    db_connection.execute(
         rf"""insert into literals select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) = '"' group by column0 order by column0 """
     )
 
-    DB.execute(
+    db_connection.execute(
         rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
-    DB.execute("pragma create_fts_index('literals', 'hash', 'value')")
-    DB.commit()
+    db_connection.execute("pragma create_fts_index('literals', 'hash', 'value')")
+    db_connection.commit()
 
     os.unlink(TRIPLE_PATH)
     os.unlink(MAP_PATH)
@@ -198,18 +213,27 @@ def q_to_sql(query: dict):
     o = str(query.get("o", "")).strip(" ")
     g = str(query.get("g", "")).strip(" ")
     pp = xxhash.xxh64_hexdigest(p).lower()
-    oo = xxhash.xxh64_hexdigest(o).lower()
+
     gg = [xxhash.xxh64_hexdigest(g_).lower() for g_ in g.split(" ")]
 
+    if o.startswith("<") and o.endswith(">") and len(o.split(" ")) > 1:
+        oo = ", ".join(
+            [
+                "'0x" + xxhash.xxh64_hexdigest(multi_o).lower() + "'::ubigint"
+                for multi_o in o.split(" ")
+            ]
+        )
+        oo = f" in ({oo})"
+    else:
+        oo = xxhash.xxh64_hexdigest(o).lower()
+        oo = f" = '0x{oo}'::ubigint"
     extra_g = ""
     if g != "":
         g_hashes = ", ".join([f"'0x{ggg}'::ubigint" for ggg in gg])
         extra_g = f" and T0.g in ({g_hashes})"
 
     if p == "" and o.startswith("<"):
-        return (
-            f"(select distinct s from triples T0 where o = '0x{oo}'::ubigint {extra_g})"
-        )
+        return f"(select distinct s from triples T0 where o{oo} {extra_g})"
     elif p == "id":
         if o.startswith("random") or o.startswith("sample"):
             o_split = o.split(" ")
@@ -221,7 +245,7 @@ def q_to_sql(query: dict):
                 except ValueError:
                     o_count = 1
             return f"(select distinct s from triples using sample {o_count} {extra_g})"
-        return f"(select distinct s from triples where s = '0x{oo}'::ubigint {extra_g})"
+        return f"(select distinct s from triples where s{oo} {extra_g})"
 
     elif p.startswith("fts"):
         parts = p.split(" ")
@@ -244,11 +268,10 @@ select distinct T{parents}.s from (select * from scored where score is not null)
 on S.hash = T0.o
 """
 
-        return psql + "\n  " + extra + f"{extra_g} order by score desc)"
+        return psql + " " + extra + f"{extra_g} )"
     elif p[0] == "<" and p[-1] == ">":
         if o:
-            return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint and o = '0x{oo}'::ubigint {extra_g})"
-
+            return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint and o{oo} {extra_g})"
         else:
             return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint {extra_g})"
 
@@ -263,6 +286,10 @@ def query(opts):
     except:
         start = 0
     queries = []
+    queries_except = []
+    # due to the way set semantic works in duckdb, the EXCEPT queries should be last in the list
+    # but we can not control how users specify them, they might be added first
+
     for query in opts.get("filters", []):
         op = query.get("op", "should")
         if not queries:
@@ -275,7 +302,6 @@ def query(opts):
             elif op == "not":
                 queries.append(" EXCEPT " + q_to_sql(query))
 
-    DB = duckdb.connect(DB_PATH)
     total = 0
     tofetch = set()
     results = {}
@@ -305,9 +331,19 @@ def query(opts):
         wanted = subjects[start : start + size]
         if wanted.shape[0] > 0:
             s_ids = ", ".join([str(row["s"]) for index, row in wanted.iterrows()])
-            triples = DB.execute(
-                f"select distinct s,p,o,g from triples  where s in ({s_ids})"
-            ).df()
+            # s_ids_case = (
+            #     "".join(
+            #         [
+            #             f'WHEN s={row["s"]} THEN {index} '
+            #             for index, row in wanted.iterrows()
+            #         ]
+            #     )
+            #     + "order by case {s_ids_case} end"
+            # )
+
+            s_ids_q = f"select distinct s,p,o,g from triples where s in ({s_ids})"
+
+            triples = DB.execute(s_ids_q).df()
 
             for index, row in triples.iterrows():
                 r_s = row.get("s")
@@ -416,11 +452,11 @@ def check_suffix(filename):
 
 if __name__ == "__main__":
     if check_suffix(sys.argv[1]):
-        build_bikidata([sys.argv[1]])
+        build_bikidata([sys.argv[1]], DB.cursor())
     else:
         filepaths = [
             os.path.join(sys.argv[1], x)
             for x in os.listdir(sys.argv[1])
             if check_suffix(x)
         ]
-        build_bikidata(filepaths)
+        build_bikidata(filepaths, DB.cursor())
