@@ -19,12 +19,6 @@ DB_PATH = os.getenv("BIKIDATA_DB", "bikidata.duckdb")
 log.debug(f"BIKIDATA_DB is configured as {DB_PATH}")
 DB = duckdb.connect(DB_PATH)
 
-try:
-    triple_count = DB.execute("select count(*) from triples").fetchall()
-    print(f"Triples in DB: {triple_count[0][0]}")
-except duckdb.CatalogException:
-    log.debug("The database is still empty")
-
 
 def literal_to_parts(literal: str):
     literal_value = language = datatype = None
@@ -263,12 +257,14 @@ def q_to_sql(query: dict):
             )
         else:
             extra = ""
-        psql = f"""(with scored as (select *, fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score from literals)
-select distinct T{parents}.s from (select * from scored where score is not null) S join triples T0
-on S.hash = T0.o
-"""
 
-        return psql + " " + extra + f"{extra_g} )"
+        extra_fts_fields = query.get("_extra_fts_fields", "")
+        psql = f"""(with scored as (select *, fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score from literals)
+    select distinct T{parents}.s{extra_fts_fields} from (select * from scored where score is not null) S join triples T0
+    on S.hash = T0.o
+    """
+        return f"{psql} {extra} {extra_g} )"
+
     elif p[0] == "<" and p[-1] == ">":
         if o:
             return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint and o{oo} {extra_g})"
@@ -287,11 +283,22 @@ def query(opts):
         start = 0
     queries = []
     queries_except = []
-    # due to the way set semantic works in duckdb, the EXCEPT queries should be last in the list
+    # due to the way set semantic works in SQL, the EXCEPT queries should be last in the list
     # but we can not control how users specify them, they might be added first
+    fts_for_sorting = []
 
     for query in opts.get("filters", []):
         op = query.get("op", "should")
+        if str(query.get("p")).startswith("fts"):
+            fts_query = query.copy()
+            fts_query["_extra_fts_fields"] = ", score "
+            if not fts_for_sorting:
+                fts_for_sorting = [q_to_sql(fts_query)]
+            else:
+                if op in ("should", "or"):
+                    fts_for_sorting.append(" UNION " + q_to_sql(fts_query))
+                elif op in ("must", "and"):
+                    fts_for_sorting.append(" INTERSECT " + q_to_sql(fts_query))
         if not queries:
             queries = [q_to_sql(query)]
         else:
@@ -300,50 +307,59 @@ def query(opts):
             elif op in ("must", "and"):
                 queries.append(" INTERSECT " + q_to_sql(query))
             elif op == "not":
-                queries.append(" EXCEPT " + q_to_sql(query))
+                queries_except.append(" EXCEPT " + q_to_sql(query))
+    queries.extend(queries_except)
 
+    db_cursor = DB.cursor()
     total = 0
     tofetch = set()
     results = {}
     aggregates = {}
 
     if len(queries) > 0:
+
+        if len(fts_for_sorting) > 0:
+            fts_queries_joined = (
+                "create temp table s_by_score as select s, max(score) as score from ("
+                + "\n".join(fts_for_sorting)
+                + ") group by s"
+            )
+            db_cursor.execute(fts_queries_joined)
+            queries_joined = (
+                "create temp table s_results as select distinct QJ.s from ("
+                + "\n".join(queries)
+                + ") QJ left join s_by_score SS on QJ.s = SS.s order by SS.score desc, QJ.s"
+            )
+        else:
+            queries_joined = (
+                "create temp table s_results as select distinct s from ("
+                + "\n".join(queries)
+                + ") order by s"
+            )
+
+        db_cursor.execute(queries_joined)
+
         # calc the total size based on unique s
-        queries_joined = "\n".join(queries)
-        subjects = DB.execute(queries_joined).df()
+        subjects = db_cursor.execute("select s from s_results").df()
         total = subjects.shape[0]
+        wanted = subjects[start : start + size]
 
         # check for aggregates
-
         for agg in opts.get("aggregates", []):
             if agg == "graphs":
-                tmp = f"select distinct count(g) as count, I.value as val from triples T join iris I on T.g = I.hash where s in ({queries_joined}) group by g, I.value"
+                tmp = f"select distinct count(g) as count, I.value as val from s_results S join triples T on S.s = T.s join iris I on T.g = I.hash group by T.g, I.value"
             elif agg == "properties":
-                tmp = f"select count(p) as count, I.value as val from triples T join iris I on T.p = I.hash where s in ({queries_joined}) group by p, I.value"
+                tmp = f"select count(p) as count, I.value as val from s_results S join triples T on S.s = T.s join iris I on T.p = I.hash group by p, I.value"
             else:
                 agg_o = xxhash.xxh64_hexdigest(str(agg)).lower()
-
-                tmp = f"(select distinct count(s) as count, I.value as val from triples T join iris I on T.o = I.hash where p = '0x{agg_o}'::ubigint and s in ({queries_joined}) group by o, I.value) union (select distinct count(s) as count, L.value as val from triples T join literals L on T.o = L.hash where p = '0x{agg_o}'::ubigint and s in ({queries_joined}) group by o, L.value) order by count desc"
-            aggs = DB.execute(tmp).df()
+                tmp = f"(select distinct count(T.s) as count, I.value as val from s_results S join triples T on S.s = T.s join iris I on T.o = I.hash where T.p = '0x{agg_o}'::ubigint group by o, I.value) union (select distinct count(T.s) as count, L.value as val from s_results S join triples T on S.s = T.s join literals L on T.o = L.hash where T.p = '0x{agg_o}'::ubigint group by T.o, L.value) order by count desc"
+            aggs = db_cursor.execute(tmp).df()
             aggregates[agg] = aggs
 
-        # get the batch based on size and start
-        wanted = subjects[start : start + size]
         if wanted.shape[0] > 0:
             s_ids = ", ".join([str(row["s"]) for index, row in wanted.iterrows()])
-            # s_ids_case = (
-            #     "".join(
-            #         [
-            #             f'WHEN s={row["s"]} THEN {index} '
-            #             for index, row in wanted.iterrows()
-            #         ]
-            #     )
-            #     + "order by case {s_ids_case} end"
-            # )
-
-            s_ids_q = f"select distinct s,p,o,g from triples where s in ({s_ids})"
-
-            triples = DB.execute(s_ids_q).df()
+            s_ids_q = f"select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s in ({s_ids})"
+            triples = db_cursor.execute(s_ids_q).df()
 
             for index, row in triples.iterrows():
                 r_s = row.get("s")
@@ -372,10 +388,10 @@ hier(source, path) as (
     from parents, hier
     where parent = hier.source
 )
-select source, path from hier where source in ({s_ids})
+select source, path from hier where source in (select s from s_results)
 """
                 buf = []
-                for _, row in DB.execute(padsql).df().iterrows():
+                for _, row in db_cursor.execute(padsql).df().iterrows():
                     padr_s = row.get("source")
                     results.setdefault(padr_s, {}).setdefault("_paths", {})
                     results[padr_s]["_paths"][pad] = list(row.get("path"))
@@ -384,11 +400,11 @@ select source, path from hier where source in ({s_ids})
 
     # Special aggregates
     if "properties" in opts.get("aggregates", []) and len(queries) < 1:
-        aggregates["properties"] = DB.execute(
+        aggregates["properties"] = db_cursor.execute(
             "select count(p) as count, I.value as val from triples T join iris I on T.p = I.hash group by p, I.value"
         ).df()
     if "graphs" in opts.get("aggregates", []) and len(queries) < 1:
-        aggregates["graphs"] = DB.execute(
+        aggregates["graphs"] = db_cursor.execute(
             "select count(g) as count, I.value as val from triples T join iris I on T.g = I.hash group by g, I.value"
         ).df()
 
@@ -398,7 +414,7 @@ select source, path from hier where source in ({s_ids})
         HV = dict(
             [
                 (hash, value)
-                for hash, value in DB.execute(
+                for hash, value in db_cursor.execute(
                     f"(select hash, value from iris where hash in ({tofetch})) union (select hash, value from literals where hash in ({tofetch}))"
                 ).fetchall()
             ]
@@ -414,21 +430,24 @@ select source, path from hier where source in ({s_ids})
                 results_mapped.setdefault(HV.get(entity), {}).setdefault(
                     HV.get(field), []
                 ).append(HV.get(val))
-        if HV.get(entity) not in results_mapped:
-            print("foo!")
-        graph = results_mapped[HV.get(entity)].get("graph", [])
-        results_mapped[HV.get(entity)]["graph"] = list(graph)
-        if "_paths" in fields:
-            for path, vals in fields["_paths"].items():
-                vals = [HV.get(val) for val in vals]
-                results_mapped[HV.get(entity)].setdefault("_paths", {})[path] = vals
+        mapped_entity = HV.get(entity)
+        if mapped_entity in results_mapped:
+            ## fetching the paths recursively can cause entities to be returned with only the path field, which is not a valid result entity. Skip them
+            graph = results_mapped[mapped_entity].get("graph", [])
+            results_mapped[mapped_entity]["graph"] = list(graph)
+            if "_paths" in fields:
+                for path, vals in fields["_paths"].items():
+                    vals = [HV.get(val) for val in vals]
+                    results_mapped[mapped_entity].setdefault("_paths", {})[path] = vals
 
-    if "dump" in opts:
-        with open(opts["dump"], "w") as DUMPFILE:
-            for entity, fields in results_mapped.items():
-                for field, vals in fields.items():
-                    for val in vals:
-                        DUMPFILE.write(f"{entity} {field} {val} .\n")
+    # This is a security risk, we can not just accept a random filename
+    # Either remove it completely, or add some form of sanitization
+    # if "dump" in opts:
+    #     with open(opts["dump"], "w") as DUMPFILE:
+    #         for entity, fields in results_mapped.items():
+    #             for field, vals in fields.items():
+    #                 for val in vals:
+    #                     DUMPFILE.write(f"{entity} {field} {val} .\n")
 
     aggregates_mapped = {}
     for agg, aggs in aggregates.items():
