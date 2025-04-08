@@ -241,6 +241,16 @@ def q_to_sql(query: dict):
             return f"(select distinct s from triples using sample {o_count} {extra_g})"
         return f"(select distinct s from triples where s{oo} {extra_g})"
 
+    elif p.startswith("regex"):
+        parts = p.split(" ")
+        extra = ""
+        if len(parts) == 2:
+            p, p_property = parts
+            if p_property[0] == "<" and p_property[-1] == ">":
+                p_property_hash = xxhash.xxh64_hexdigest(p_property).lower()
+                extra = f" and T.p = '0x{p_property_hash}'::ubigint"
+        psql = f"select distinct T.s from triples T join literals L on T.o = L.hash where L.value similar to '{o}'{extra} {extra_g}"
+        return psql
     elif p.startswith("fts"):
         parts = p.split(" ")
         parents = 0
