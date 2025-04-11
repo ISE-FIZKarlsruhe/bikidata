@@ -312,13 +312,17 @@ def query(opts):
         if not queries:
             queries = [q_to_sql(query)]
         else:
+            theq = q_to_sql(query)
+            if not theq:
+                continue
             if op in ("should", "or"):
-                queries.append(" UNION " + q_to_sql(query))
+                queries.append(" UNION " + theq)
             elif op in ("must", "and"):
-                queries.append(" INTERSECT " + q_to_sql(query))
+                queries.append(" INTERSECT " + theq)
             elif op == "not":
-                queries_except.append(" EXCEPT " + q_to_sql(query))
+                queries_except.append(" EXCEPT " + theq)
     queries.extend(queries_except)
+    queries = filter(None, queries)
 
     db_cursor = DB.cursor()
     total = 0
