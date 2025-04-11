@@ -325,7 +325,7 @@ def query(opts):
             elif op == "not":
                 queries_except.append(" EXCEPT " + theq)
     queries.extend(queries_except)
-    queries = filter(None, queries)
+    queries = list(filter(None, queries))
 
     db_cursor = DB.cursor()
     total = 0
