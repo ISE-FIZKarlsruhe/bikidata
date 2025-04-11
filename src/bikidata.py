@@ -455,7 +455,7 @@ select source, path from hier where source in (select s from s_results)
             results_mapped[mapped_entity]["graph"] = list(graph)
             if "_paths" in fields:
                 for path, vals in fields["_paths"].items():
-                    vals = [HV.get(val) for val in vals]
+                    vals = [HV.get(val) for val in vals if val != entity]
                     results_mapped[mapped_entity].setdefault("_paths", {})[path] = vals
 
     # This is a security risk, we can not just accept a random filename
