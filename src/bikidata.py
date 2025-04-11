@@ -121,7 +121,7 @@ def H(v: str):
 
 def build_bikidata(
     triplefile_paths: list,
-    db_connection: duckdb.DuckDBPyConnection,
+    stemmer: str = "porter",
 ):
     if len(triplefile_paths) > 0:
         log.debug(f"Building Bikidata index with {triplefile_paths}")
@@ -130,6 +130,7 @@ def build_bikidata(
         log.error("No triples to index, triplefile_paths not given")
         return
 
+    db_connection = DB.cursor()
     try:
         triple_count = db_connection.execute("select count(*) from triples").fetchall()
         if triple_count[0][0] > 0:
@@ -190,7 +191,9 @@ def build_bikidata(
     db_connection.execute(
         rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
-    db_connection.execute("pragma create_fts_index('literals', 'hash', 'value')")
+    db_connection.execute(
+        f"pragma create_fts_index('literals', 'hash', 'value', stemmer='{stemmer}')"
+    )
     db_connection.commit()
 
     os.unlink(TRIPLE_PATH)
