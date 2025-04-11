@@ -449,6 +449,7 @@ select source, path from hier where source in (select s from s_results)
                 ).append(HV.get(val))
         mapped_entity = HV.get(entity)
         if mapped_entity in results_mapped:
+            results_mapped[mapped_entity]["id"] = mapped_entity
             ## fetching the paths recursively can cause entities to be returned with only the path field, which is not a valid result entity. Skip them
             graph = results_mapped[mapped_entity].get("graph", [])
             results_mapped[mapped_entity]["graph"] = list(graph)
