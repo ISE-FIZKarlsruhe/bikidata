@@ -2,11 +2,14 @@ import sys, logging, gzip, re, os
 import duckdb
 import xxhash
 
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+
 log = logging.getLogger("bikidata")
 handler = logging.StreamHandler()
 log.addHandler(handler)
-log.setLevel(logging.DEBUG)
-handler.setLevel(logging.DEBUG)
+if DEBUG:
+    log.setLevel(logging.DEBUG)
+    handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter(
     "%(levelname)-9s %(name)s %(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -118,6 +121,7 @@ def H(v: str):
 
 def build_bikidata(
     triplefile_paths: list,
+    stemmer: str = "porter",
 ):
     if len(triplefile_paths) > 0:
         log.debug(f"Building Bikidata index with {triplefile_paths}")
@@ -125,6 +129,15 @@ def build_bikidata(
     else:
         log.error("No triples to index, triplefile_paths not given")
         return
+
+    db_connection = DB.cursor()
+    try:
+        triple_count = db_connection.execute("select count(*) from triples").fetchall()
+        if triple_count[0][0] > 0:
+            log.debug(f"The database [{DB_PATH}] already has data, doing nothing")
+            return
+    except duckdb.CatalogException:
+        log.debug("No triples in database yet")
 
     TRIPLE_PATH = os.getenv("BIKIDATA_TRIPLE_PATH", "triples")
     MAP_PATH = os.getenv("BIKIDATA_MAP_PATH", "maps")
@@ -136,15 +149,24 @@ def build_bikidata(
 
     all_graphs = set()
     for s, p, o, g in iterator:
-        ss = H(s)
-        pp = H(p)
-        oo = H(o)
-        gg = H(g)
-        all_graphs.add(g)
-        TRIPLE_OUT_FILE.write(f"{ss}\t{pp}\t{oo}\t{gg}\n")
-        MAP_OUT_FILE.write(f"{ss}\t|\t{s}\n")
-        MAP_OUT_FILE.write(f"{pp}\t|\t{p}\n")
-        MAP_OUT_FILE.write(f"{oo}\t|\t{o}\n")
+        try:
+            ss = H(s)
+            pp = H(p)
+            oo = H(o)
+            gg = H(g)
+            all_graphs.add(g)
+            TRIPLE_OUT_FILE.write(f"{ss}\t{pp}\t{oo}\t{gg}\n")
+            MAP_OUT_FILE.write(f"{ss}\t|\t{s}\n")
+            MAP_OUT_FILE.write(f"{pp}\t|\t{p}\n")
+            MAP_OUT_FILE.write(f"{oo}\t|\t{o}\n")
+        except UnicodeEncodeError as e:
+            log.error(f"Error hashing {e}")
+            continue
+            # Certain strings can casues errors, especially emojis encoded in JSON
+            # For example, "\ud83d\ude09" is how the smiley gets encoded in JSON (as a Javascript string)
+            # If you try to treat this as a UTF-8 string it throws an error.
+            # json.loads(r'"\ud83d\ude09"') <- this works
+            # "\ud83d\ude09".encode('utf8') <- this throws an error
     for g in all_graphs:
         gg = H(g)
         MAP_OUT_FILE.write(f"{gg}\t|\t{g}\n")
@@ -158,23 +180,29 @@ def build_bikidata(
     create table if not exists triples (s ubigint, p ubigint, o ubigint, g ubigint);    
     """
 
-    DB = duckdb.connect(DB_PATH)
-    DB.execute(DB_SCHEMA)
-    DB.execute(
+    db_connection.execute(DB_SCHEMA)
+    db_connection.execute(
         rf"insert into triples(s,p,o,g) select ('0x' || column0).lower()::ubigint, ('0x' || column1).lower()::ubigint, ('0x' || column2).lower()::ubigint, ('0x' || column3).lower()::ubigint from read_csv('{TRIPLE_PATH}', delim='\t', header=false)"
     )
-    DB.execute(
-        rf"""insert into literals select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000) where substr(column1, 1, 1) = '"' group by column0 order by column0 """
+    db_connection.execute(
+        rf"""insert into literals select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) = '"' group by column0 order by column0 """
     )
 
-    DB.execute(
-        rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000) where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
+    db_connection.execute(
+        rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
-    DB.execute("pragma create_fts_index('literals', 'hash', 'value')")
-    DB.commit()
+    db_connection.execute(
+        f"pragma create_fts_index('literals', 'hash', 'value', stemmer='{stemmer}')"
+    )
+    db_connection.commit()
 
     os.unlink(TRIPLE_PATH)
     os.unlink(MAP_PATH)
+
+
+####################################################################################
+####################################################################################
+####################################################################################
 
 
 def q_to_sql(query: dict):
@@ -182,30 +210,50 @@ def q_to_sql(query: dict):
     o = str(query.get("o", "")).strip(" ")
     g = str(query.get("g", "")).strip(" ")
     pp = xxhash.xxh64_hexdigest(p).lower()
-    oo = xxhash.xxh64_hexdigest(o).lower()
+
     gg = [xxhash.xxh64_hexdigest(g_).lower() for g_ in g.split(" ")]
 
+    if o.startswith("<") and o.endswith(">") and len(o.split(" ")) > 1:
+        oo = ", ".join(
+            [
+                "'0x" + xxhash.xxh64_hexdigest(multi_o).lower() + "'::ubigint"
+                for multi_o in o.split(" ")
+            ]
+        )
+        oo = f" in ({oo})"
+    else:
+        oo = xxhash.xxh64_hexdigest(o).lower()
+        oo = f" = '0x{oo}'::ubigint"
     extra_g = ""
     if g != "":
         g_hashes = ", ".join([f"'0x{ggg}'::ubigint" for ggg in gg])
         extra_g = f" and T0.g in ({g_hashes})"
 
     if p == "" and o.startswith("<"):
-        return (
-            f"(select distinct s from triples T0 where o = '0x{oo}'::ubigint {extra_g})"
-        )
+        return f"(select distinct s from triples T0 where o{oo} {extra_g})"
     elif p == "id":
         if o.startswith("random") or o.startswith("sample"):
             o_split = o.split(" ")
+            o_count = 1
             if len(o_split) > 1:
                 o = o_split[0]
                 try:
                     o_count = int(o_split[1])
                 except ValueError:
                     o_count = 1
-            f"(select distinct s from triples using sample {o_count} {extra_g})"
-        return f"(select distinct s from triples where s = '0x{oo}'::ubigint {extra_g})"
+            return f"(select distinct s from triples using sample {o_count} {extra_g})"
+        return f"(select distinct s from triples where s{oo} {extra_g})"
 
+    elif p.startswith("regex"):
+        parts = p.split(" ")
+        extra = ""
+        if len(parts) == 2:
+            p, p_property = parts
+            if p_property[0] == "<" and p_property[-1] == ">":
+                p_property_hash = xxhash.xxh64_hexdigest(p_property).lower()
+                extra = f" and T.p = '0x{p_property_hash}'::ubigint"
+        psql = f"select distinct T.s from triples T join literals L on T.o = L.hash where L.value similar to '{o}'{extra} {extra_g}"
+        return psql
     elif p.startswith("fts"):
         parts = p.split(" ")
         parents = 0
@@ -222,16 +270,17 @@ def q_to_sql(query: dict):
             )
         else:
             extra = ""
-        psql = f"""(with scored as (select *, fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score from literals)
-select distinct T{parents}.s from (select * from scored where score is not null) S join triples T0
-on S.hash = T0.o
-"""
 
-        return psql + "\n  " + extra + f"{extra_g} order by score desc)"
+        extra_fts_fields = query.get("_extra_fts_fields", "")
+        psql = f"""(with scored as (select *, fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score from literals)
+    select distinct T{parents}.s{extra_fts_fields} from (select * from scored where score is not null) S join triples T0
+    on S.hash = T0.o
+    """
+        return f"{psql} {extra} {extra_g} )"
+
     elif p[0] == "<" and p[-1] == ">":
         if o:
-            return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint and o = '0x{oo}'::ubigint {extra_g})"
-
+            return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint and o{oo} {extra_g})"
         else:
             return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint {extra_g})"
 
@@ -246,50 +295,88 @@ def query(opts):
     except:
         start = 0
     queries = []
+    queries_except = []
+    # due to the way set semantic works in SQL, the EXCEPT queries should be last in the list
+    # but we can not control how users specify them, they might be added first
+    fts_for_sorting = []
+
     for query in opts.get("filters", []):
         op = query.get("op", "should")
+        if str(query.get("p")).startswith("fts"):
+            fts_query = query.copy()
+            fts_query["_extra_fts_fields"] = ", score "
+            if not fts_for_sorting:
+                fts_for_sorting = [q_to_sql(fts_query)]
+            else:
+                if op in ("should", "or"):
+                    fts_for_sorting.append(" UNION " + q_to_sql(fts_query))
+                elif op in ("must", "and"):
+                    fts_for_sorting.append(" INTERSECT " + q_to_sql(fts_query))
         if not queries:
             queries = [q_to_sql(query)]
         else:
+            theq = q_to_sql(query)
+            if not theq:
+                continue
             if op in ("should", "or"):
-                queries.append(" UNION " + q_to_sql(query))
+                queries.append(" UNION " + theq)
             elif op in ("must", "and"):
-                queries.append(" INTERSECT " + q_to_sql(query))
+                queries.append(" INTERSECT " + theq)
             elif op == "not":
-                queries.append(" EXCEPT " + q_to_sql(query))
+                queries_except.append(" EXCEPT " + theq)
+    queries.extend(queries_except)
+    queries = list(filter(None, queries))
 
+    db_cursor = DB.cursor()
     total = 0
     tofetch = set()
     results = {}
     aggregates = {}
 
     if len(queries) > 0:
+
+        if len(fts_for_sorting) > 0:
+            fts_queries_joined = (
+                "create temp table s_by_score as select s, max(score) as score from ("
+                + "\n".join(fts_for_sorting)
+                + ") group by s"
+            )
+            db_cursor.execute(fts_queries_joined)
+            queries_joined = (
+                "create temp table s_results as select distinct QJ.s from ("
+                + "\n".join(queries)
+                + ") QJ left join s_by_score SS on QJ.s = SS.s order by SS.score desc, QJ.s"
+            )
+        else:
+            queries_joined = (
+                "create temp table s_results as select distinct s from ("
+                + "\n".join(queries)
+                + ") order by s"
+            )
+
+        db_cursor.execute(queries_joined)
+
         # calc the total size based on unique s
-        queries_joined = "\n".join(queries)
-        subjects = DB.execute(queries_joined).df()
+        subjects = db_cursor.execute("select s from s_results").df()
         total = subjects.shape[0]
+        wanted = subjects[start : start + size]
 
         # check for aggregates
-
         for agg in opts.get("aggregates", []):
             if agg == "graphs":
-                tmp = f"select distinct count(g) as count, I.value as val from triples T join iris I on T.g = I.hash where s in ({queries_joined}) group by g, I.value"
+                tmp = f"select distinct count(g) as count, I.value as val from s_results S join triples T on S.s = T.s join iris I on T.g = I.hash group by T.g, I.value"
             elif agg == "properties":
-                tmp = f"select count(p) as count, I.value as val from triples T join iris I on T.p = I.hash where s in ({queries_joined}) group by p, I.value"
+                tmp = f"select count(p) as count, I.value as val from s_results S join triples T on S.s = T.s join iris I on T.p = I.hash group by p, I.value"
             else:
                 agg_o = xxhash.xxh64_hexdigest(str(agg)).lower()
-
-                tmp = f"(select distinct count(s) as count, I.value as val from triples T join iris I on T.o = I.hash where p = '0x{agg_o}'::ubigint and s in ({queries_joined}) group by o, I.value) union (select distinct count(s) as count, L.value as val from triples T join literals L on T.o = L.hash where p = '0x{agg_o}'::ubigint and s in ({queries_joined}) group by o, L.value) order by count desc"
-            aggs = DB.execute(tmp).df()
+                tmp = f"(select distinct count(T.s) as count, I.value as val from s_results S join triples T on S.s = T.s join iris I on T.o = I.hash where T.p = '0x{agg_o}'::ubigint group by o, I.value) union (select distinct count(T.s) as count, L.value as val from s_results S join triples T on S.s = T.s join literals L on T.o = L.hash where T.p = '0x{agg_o}'::ubigint group by T.o, L.value) order by count desc"
+            aggs = db_cursor.execute(tmp).df()
             aggregates[agg] = aggs
 
-        # get the batch based on size and start
-        wanted = subjects[start : start + size]
         if wanted.shape[0] > 0:
             s_ids = ", ".join([str(row["s"]) for index, row in wanted.iterrows()])
-            triples = DB.execute(
-                f"select distinct s,p,o,g from triples  where s in ({s_ids})"
-            ).df()
+            s_ids_q = f"select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s in ({s_ids})"
+            triples = db_cursor.execute(s_ids_q).df()
 
             for index, row in triples.iterrows():
                 r_s = row.get("s")
@@ -318,10 +405,10 @@ hier(source, path) as (
     from parents, hier
     where parent = hier.source
 )
-select source, path from hier where source in ({s_ids})
+select source, path from hier where source in (select s from s_results)
 """
                 buf = []
-                for _, row in DB.execute(padsql).df().iterrows():
+                for _, row in db_cursor.execute(padsql).df().iterrows():
                     padr_s = row.get("source")
                     results.setdefault(padr_s, {}).setdefault("_paths", {})
                     results[padr_s]["_paths"][pad] = list(row.get("path"))
@@ -330,11 +417,11 @@ select source, path from hier where source in ({s_ids})
 
     # Special aggregates
     if "properties" in opts.get("aggregates", []) and len(queries) < 1:
-        aggregates["properties"] = DB.execute(
+        aggregates["properties"] = db_cursor.execute(
             "select count(p) as count, I.value as val from triples T join iris I on T.p = I.hash group by p, I.value"
         ).df()
     if "graphs" in opts.get("aggregates", []) and len(queries) < 1:
-        aggregates["graphs"] = DB.execute(
+        aggregates["graphs"] = db_cursor.execute(
             "select count(g) as count, I.value as val from triples T join iris I on T.g = I.hash group by g, I.value"
         ).df()
 
@@ -344,7 +431,7 @@ select source, path from hier where source in ({s_ids})
         HV = dict(
             [
                 (hash, value)
-                for hash, value in DB.execute(
+                for hash, value in db_cursor.execute(
                     f"(select hash, value from iris where hash in ({tofetch})) union (select hash, value from literals where hash in ({tofetch}))"
                 ).fetchall()
             ]
@@ -360,21 +447,25 @@ select source, path from hier where source in ({s_ids})
                 results_mapped.setdefault(HV.get(entity), {}).setdefault(
                     HV.get(field), []
                 ).append(HV.get(val))
-        if HV.get(entity) not in results_mapped:
-            print("foo!")
-        graph = results_mapped[HV.get(entity)].get("graph", [])
-        results_mapped[HV.get(entity)]["graph"] = list(graph)
-        if "_paths" in fields:
-            for path, vals in fields["_paths"].items():
-                vals = [HV.get(val) for val in vals]
-                results_mapped[HV.get(entity)].setdefault("_paths", {})[path] = vals
+        mapped_entity = HV.get(entity)
+        if mapped_entity in results_mapped:
+            results_mapped[mapped_entity]["id"] = mapped_entity
+            ## fetching the paths recursively can cause entities to be returned with only the path field, which is not a valid result entity. Skip them
+            graph = results_mapped[mapped_entity].get("graph", [])
+            results_mapped[mapped_entity]["graph"] = list(graph)
+            if "_paths" in fields:
+                for path, vals in fields["_paths"].items():
+                    vals = [HV.get(val) for val in vals if val != entity]
+                    results_mapped[mapped_entity].setdefault("_paths", {})[path] = vals
 
-    if "dump" in opts:
-        with open(opts["dump"], "w") as DUMPFILE:
-            for entity, fields in results_mapped.items():
-                for field, vals in fields.items():
-                    for val in vals:
-                        DUMPFILE.write(f"{entity} {field} {val} .\n")
+    # This is a security risk, we can not just accept a random filename
+    # Either remove it completely, or add some form of sanitization
+    # if "dump" in opts:
+    #     with open(opts["dump"], "w") as DUMPFILE:
+    #         for entity, fields in results_mapped.items():
+    #             for field, vals in fields.items():
+    #                 for val in vals:
+    #                     DUMPFILE.write(f"{entity} {field} {val} .\n")
 
     aggregates_mapped = {}
     for agg, aggs in aggregates.items():
@@ -398,11 +489,11 @@ def check_suffix(filename):
 
 if __name__ == "__main__":
     if check_suffix(sys.argv[1]):
-        build_bikidata([sys.argv[1]])
+        build_bikidata([sys.argv[1]], DB.cursor())
     else:
         filepaths = [
             os.path.join(sys.argv[1], x)
             for x in os.listdir(sys.argv[1])
             if check_suffix(x)
         ]
-        build_bikidata(filepaths)
+        build_bikidata(filepaths, DB.cursor())

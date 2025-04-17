@@ -19,9 +19,10 @@ import bikidata
 
 r = bikidata.query({
     "filters": [
-        {"p":"fts", "o":"something"}
-        ]
-    "size": 20
+        {"p":"fts",
+         "o":"something"
+        }
+    ]
 })
 ```
 
@@ -30,9 +31,10 @@ or
 ```python
 r = bikidata.query({
     "filters": [
-        {"p":"id", "o":"<http://example.com/id/123>"}
-        ]
-    "size": 20
+        { "p":"id",
+          "o":"<http://example.com/id/123>"
+        }
+    ]
 })
 ```
 
@@ -41,8 +43,15 @@ or
 ```python
 r = bikidata.query({
     "filters": [
-        {"p":"id", "o":"<http://example.com/id/123>"}
-        ]
-    "size": 20
+        {"p":"fts",
+         "o":"something"
+        },
+        { "op":"not",
+          "p":"<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+          "o":"<https://swapi.co/vocabulary/Species>"
+        }
+    ]
 })
 ```
+
+For more examples, see the file: [examples.ipynb](examples.ipynb)
