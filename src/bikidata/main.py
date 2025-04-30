@@ -119,7 +119,7 @@ def H(v: str):
     return xxhash.xxh64_hexdigest(v).upper()
 
 
-def build_bikidata(
+def build(
     triplefile_paths: list,
     stemmer: str = "porter",
 ):
@@ -191,8 +191,40 @@ def build_bikidata(
     db_connection.execute(
         rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
+    # For effective searches, the literals should be grouped by entity
     db_connection.execute(
-        f"pragma create_fts_index('literals', 'hash', 'value', stemmer='{stemmer}')"
+        """
+CREATE TEMPORARY TABLE temp_fts1 AS
+WITH list_values AS (
+  SELECT
+    s, list_distinct(list(value)) AS value_list
+  FROM
+    triples T
+    JOIN literals L ON T.o = L.hash
+  GROUP BY s
+),
+unnested AS (
+  SELECT s, unnest(value_list) AS val FROM list_values
+)
+SELECT
+  s,
+  string_agg(val, '\n') AS values
+FROM unnested GROUP BY s
+"""
+    )
+    db_connection.execute(
+        "CREATE TEMPORARY TABLE temp_fts2 AS SELECT T.s, string_agg(R.concatenated_values, '\n') AS values FROM triples T JOIN temp_fts1 R ON T.o = R.s  GROUP BY T.s"
+    )
+    db_connection.execute(
+        """
+CREATE TEMPORARY TABLE temp_fts AS select s, string_agg(values, '\t') AS values 
+FROM 
+    (SELECT s, values FROM temp_fts1 UNION SELECT s, values FROM temp_fts2) 
+GROUP BY s
+"""
+    )
+    db_connection.execute(
+        f"pragma create_fts_index('temp_fts', 's', 'values', stemmer='{stemmer}')"
     )
     db_connection.commit()
 
@@ -478,22 +510,3 @@ select source, path from hier where source in (select s from s_results)
         back["aggregates"] = aggregates_mapped
 
     return back
-
-
-def check_suffix(filename):
-    for suffix in (".gz", ".nt", ".trig"):
-        if filename.endswith(suffix):
-            return True
-    return False
-
-
-if __name__ == "__main__":
-    if check_suffix(sys.argv[1]):
-        build_bikidata([sys.argv[1]], DB.cursor())
-    else:
-        filepaths = [
-            os.path.join(sys.argv[1], x)
-            for x in os.listdir(sys.argv[1])
-            if check_suffix(x)
-        ]
-        build_bikidata(filepaths, DB.cursor())
