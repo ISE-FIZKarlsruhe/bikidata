@@ -213,7 +213,7 @@ FROM unnested GROUP BY s
 """
     )
     db_connection.execute(
-        "CREATE TEMPORARY TABLE temp_fts2 AS SELECT T.s, string_agg(R.concatenated_values, '\n') AS values FROM triples T JOIN temp_fts1 R ON T.o = R.s  GROUP BY T.s"
+        "CREATE TEMPORARY TABLE temp_fts2 AS SELECT T.s, string_agg(R.values, '\n') AS values FROM triples T JOIN temp_fts1 R ON T.o = R.s  GROUP BY T.s"
     )
     db_connection.execute(
         """
