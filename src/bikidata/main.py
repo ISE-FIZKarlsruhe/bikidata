@@ -191,7 +191,19 @@ def build(
     db_connection.execute(
         rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
+    db_connection.execute(
+        f"pragma create_fts_index('literals', 'hash', 'value', stemmer='{stemmer}')"
+    )
+    db_connection.commit()
+
+    os.unlink(TRIPLE_PATH)
+    os.unlink(MAP_PATH)
+
+
+def build_ftss(stemmer: str = "porter"):
     # For effective searches, the literals should be grouped by entity
+    db_connection = DB.cursor()
+
     db_connection.execute(
         """
 CREATE TEMPORARY TABLE temp_fts1 AS
@@ -217,19 +229,17 @@ FROM unnested GROUP BY s
     )
     db_connection.execute(
         """
-CREATE TEMPORARY TABLE temp_fts AS select s, string_agg(values, '\t') AS values 
+CREATE TABLE fts AS select s, string_agg(values, '\t') AS values 
 FROM 
     (SELECT s, values FROM temp_fts1 UNION SELECT s, values FROM temp_fts2) 
 GROUP BY s
 """
     )
     db_connection.execute(
-        f"pragma create_fts_index('temp_fts', 's', 'values', stemmer='{stemmer}')"
+        f"pragma create_fts_index('fts', 's', 'values', stemmer='{stemmer}')"
     )
+    db_connection.execute("update fts set values = null")
     db_connection.commit()
-
-    os.unlink(TRIPLE_PATH)
-    os.unlink(MAP_PATH)
 
 
 ####################################################################################
@@ -261,6 +271,8 @@ def q_to_sql(query: dict):
         g_hashes = ", ".join([f"'0x{ggg}'::ubigint" for ggg in gg])
         extra_g = f" and T0.g in ({g_hashes})"
 
+    extra_fts_fields = query.get("_extra_fts_fields", "")
+
     if p == "" and o.startswith("<"):
         return f"(select distinct s from triples T0 where o{oo} {extra_g})"
     elif p == "id":
@@ -286,6 +298,10 @@ def q_to_sql(query: dict):
                 extra = f" and T.p = '0x{p_property_hash}'::ubigint"
         psql = f"select distinct T.s from triples T join literals L on T.o = L.hash where L.value similar to '{o}'{extra} {extra_g}"
         return psql
+    elif p.startswith("ftss"):
+        psql = f"""(with scored as (select *, fts_main_fts.match_bm25(s, '{o}', conjunctive:=1) AS score from fts)
+select s{extra_fts_fields} from scored where score is not null"""
+        return f"{psql} {extra_g} )"
     elif p.startswith("fts"):
         parts = p.split(" ")
         parents = 0
@@ -303,7 +319,6 @@ def q_to_sql(query: dict):
         else:
             extra = ""
 
-        extra_fts_fields = query.get("_extra_fts_fields", "")
         psql = f"""(with scored as (select *, fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score from literals)
     select distinct T{parents}.s{extra_fts_fields} from (select * from scored where score is not null) S join triples T0
     on S.hash = T0.o
