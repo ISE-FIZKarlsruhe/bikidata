@@ -1,8 +1,8 @@
-import sys, logging, gzip, re, os
+import sys, logging, gzip, re, os, time
 import duckdb
 import xxhash
 
-DEBUG = os.environ.get("DEBUG", "0") == "1"
+DEBUG = os.environ.get("DEBUG", "1") == "1"
 
 log = logging.getLogger("bikidata")
 handler = logging.StreamHandler()
@@ -127,15 +127,20 @@ def build(
         log.debug(f"Building Bikidata index with {triplefile_paths}")
         iterator = read_nt(triplefile_paths)
     else:
-        log.error("No triples to index, triplefile_paths not given")
-        return
+        error = "No triples to index, triplefile_paths length < 1"
+        log.error(error)
+        return {"duration": 0, "error": error}
+
+    start_time = time.time()
 
     db_connection = DB.cursor()
     try:
         triple_count = db_connection.execute("select count(*) from triples").fetchall()
         if triple_count[0][0] > 0:
-            log.debug(f"The database [{DB_PATH}] already has data, doing nothing")
-            return
+            error = f"The database [{DB_PATH}] already has data, doing nothing"
+            log.debug(error)
+            return {"duration": 0, "error": error}
+
     except duckdb.CatalogException:
         log.debug("No triples in database yet")
 
@@ -198,10 +203,14 @@ def build(
 
     os.unlink(TRIPLE_PATH)
     os.unlink(MAP_PATH)
+    end_time = time.time()
+    return {"duration": int(end_time - start_time)}
 
 
 def build_ftss(stemmer: str = "porter"):
     # For effective searches, the literals should be grouped by entity
+    start_time = time.time()
+
     db_connection = DB.cursor()
 
     db_connection.execute(
@@ -240,6 +249,8 @@ GROUP BY s
     )
     db_connection.execute("update fts set values = null")
     db_connection.commit()
+    end_time = time.time()
+    return {"duration": int(end_time - start_time)}
 
 
 ####################################################################################
