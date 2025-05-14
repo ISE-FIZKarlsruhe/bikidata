@@ -1,4 +1,4 @@
-from .semantic import embedder
+from .semantic import get_embedding, VEC_DIM
 import xxhash
 from .main import DB_PATH, log
 import duckdb
@@ -51,8 +51,8 @@ def q_to_sql(query: dict):
         return f"(select distinct s from triples where s{oo} {extra_g})"
     elif p.startswith("semantic"):
         # convert the o to a vector
-        q_vector = embedder.get_embeddings(o)
-        return f"""(select distinct s{extra_fts_fields} from (select T0.s, array_distance(vec, CAST({q_vector} AS FLOAT[768])) as distance, 1/distance as score from literals_semantic LS join triples T0 on T0.o = LS.hash where distance < 0.09 {extra_g}))
+        q_vector = get_embedding(o)
+        return f"""(select distinct s{extra_fts_fields} from (select T0.s, array_cosine_distance(vec, CAST({q_vector} AS FLOAT[{VEC_DIM}])) as distance, 1/distance as score from literals_semantic LS join triples T0 on T0.s = LS.hash where distance < 0.5 {extra_g}))
         """
 
     elif p.startswith("regex"):
