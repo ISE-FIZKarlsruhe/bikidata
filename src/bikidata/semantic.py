@@ -3,7 +3,8 @@ import platform
 from transformers import AutoTokenizer, AutoModel
 import torch
 import torch.nn.functional as F
-from .main import DB, log
+import duckdb
+from .main import DB_PATH, log
 
 MAX_LENGTH = 8192
 
@@ -46,12 +47,14 @@ class EuroBERTEmbedder:
         return normalized_cls_embedding[0].tolist()
 
 
+embedder = EuroBERTEmbedder()
+
+
 def build_semantic():
     BATCH_SIZE = 1000
     start_time = time.time()
 
-    emb = EuroBERTEmbedder()
-
+    DB = duckdb.connect(DB_PATH)
     db_connection = DB.cursor()
 
     db_connection.execute(
@@ -64,7 +67,7 @@ def build_semantic():
         if not value:
             continue
         try:
-            embedding = emb.get_embeddings(value)
+            embedding = embedder.get_embeddings(value)
             buf.append((hash, embedding))
         except Exception as e:
             log.error(f"Error processing value: {value}, error: {e}")
