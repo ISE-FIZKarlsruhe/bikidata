@@ -1,208 +1,12 @@
-import sys, logging, gzip, re, os
-import duckdb
+from .semantic import get_embedding, VEC_DIM
 import xxhash
-
-DEBUG = os.environ.get("DEBUG", "0") == "1"
-
-log = logging.getLogger("bikidata")
-handler = logging.StreamHandler()
-log.addHandler(handler)
-if DEBUG:
-    log.setLevel(logging.DEBUG)
-    handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter(
-    "%(levelname)-9s %(name)s %(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-handler.setFormatter(formatter)
-
-DB_PATH = os.getenv("BIKIDATA_DB", "bikidata.duckdb")
-log.debug(f"BIKIDATA_DB is configured as {DB_PATH}")
-DB = duckdb.connect(DB_PATH)
+from .main import DB_PATH, log
+import duckdb
 
 
-def literal_to_parts(literal: str):
-    literal_value = language = datatype = None
-    if literal.startswith('"'):
-        end_index = literal.rfind('"')
-        if end_index > 0:
-            literal_value = literal[1:end_index]
-            remainder = literal[end_index + 1 :].strip()
-            language = datatype = None
-            if remainder.startswith("@"):
-                language = remainder[1:]
-                datatype = None
-            elif remainder.startswith("^^"):
-                datatype = remainder[2:]
-                language = None
-    return literal_value, language, datatype
-
-
-def decode_unicode_escapes(s):
-    # See: https://www.w3.org/TR/n-triples/#grammar-production-UCHAR
-    unicode_escape_pattern_u = re.compile(
-        r"\\u([0-9a-fA-F]{4})"
-    )  # \uXXXX (4 hex digits)
-    unicode_escape_pattern_U = re.compile(
-        r"\\U([0-9a-fA-F]{8})"
-    )  # \UXXXXXXXX (8 hex digits)
-
-    def replace_unicode_escape_u(match):
-        hex_value = match.group(1)
-        return chr(
-            int(hex_value, 16)
-        )  # Convert hex to integer, then to Unicode character
-
-    def replace_unicode_escape_U(match):
-        hex_value = match.group(1)
-        return chr(
-            int(hex_value, 16)
-        )  # Convert hex to integer, then to Unicode character
-
-    s = unicode_escape_pattern_U.sub(replace_unicode_escape_U, s)
-    s = unicode_escape_pattern_u.sub(replace_unicode_escape_u, s)
-
-    return s
-
-
-class StringParamException(Exception):
-    pass
-
-
-def read_nt(triplefile_paths: list):
-    if not type(triplefile_paths) == list:
-        raise StringParamException(
-            "triplefile_paths must be a list of paths to n-triple files, or file-like objects"
-        )
-    for triplefile_path in triplefile_paths:
-        if isinstance(triplefile_path, (str, bytes, os.PathLike)):
-            if triplefile_path.endswith(".gz"):
-                thefile = gzip.open(triplefile_path, "rb")
-            else:
-                thefile = open(triplefile_path, "rb")
-        elif hasattr(triplefile_path, "read"):
-            thefile = triplefile_path
-        else:
-            raise StringParamException(
-                "Each path in triplefile_paths must be a string, bytes, os.PathLike object, or a file-like object"
-            )
-
-        g = ""
-        for line in thefile:
-            if not line.endswith(b" .\n"):
-                if line.endswith(b" {\n") and line.startswith(b"<"):
-                    # Cater for .trig files by looking for a pattern like
-                    # ^<IRI> {\n
-                    parts = line.decode("utf8").split(" ")
-                    if len(parts) == 2:
-                        g = parts[0]
-                        continue
-                else:
-                    continue
-            line = decode_unicode_escapes(line.decode("utf8"))
-            line = line.strip()
-            line = line[:-2]
-            parts = line.split(" ")
-            if len(parts) > 2:
-                s = parts[0]
-                p = parts[1]
-                o = " ".join(parts[2:])
-
-            if not (s.startswith("<") and s.endswith(">")):
-                continue
-            if not (p.startswith("<") and p.endswith(">")):
-                continue
-
-            yield s, p, o, g
-
-
-def H(v: str):
-    return xxhash.xxh64_hexdigest(v).upper()
-
-
-def build_bikidata(
-    triplefile_paths: list,
-    stemmer: str = "porter",
-):
-    if len(triplefile_paths) > 0:
-        log.debug(f"Building Bikidata index with {triplefile_paths}")
-        iterator = read_nt(triplefile_paths)
-    else:
-        log.error("No triples to index, triplefile_paths not given")
-        return
-
-    db_connection = DB.cursor()
-    try:
-        triple_count = db_connection.execute("select count(*) from triples").fetchall()
-        if triple_count[0][0] > 0:
-            log.debug(f"The database [{DB_PATH}] already has data, doing nothing")
-            return
-    except duckdb.CatalogException:
-        log.debug("No triples in database yet")
-
-    TRIPLE_PATH = os.getenv("BIKIDATA_TRIPLE_PATH", "triples")
-    MAP_PATH = os.getenv("BIKIDATA_MAP_PATH", "maps")
-
-    count = 0
-
-    TRIPLE_OUT_FILE = open(TRIPLE_PATH, "w")
-    MAP_OUT_FILE = open(MAP_PATH, "w")
-
-    all_graphs = set()
-    for s, p, o, g in iterator:
-        try:
-            ss = H(s)
-            pp = H(p)
-            oo = H(o)
-            gg = H(g)
-            all_graphs.add(g)
-            TRIPLE_OUT_FILE.write(f"{ss}\t{pp}\t{oo}\t{gg}\n")
-            MAP_OUT_FILE.write(f"{ss}\t|\t{s}\n")
-            MAP_OUT_FILE.write(f"{pp}\t|\t{p}\n")
-            MAP_OUT_FILE.write(f"{oo}\t|\t{o}\n")
-        except UnicodeEncodeError as e:
-            log.error(f"Error hashing {e}")
-            continue
-            # Certain strings can casues errors, especially emojis encoded in JSON
-            # For example, "\ud83d\ude09" is how the smiley gets encoded in JSON (as a Javascript string)
-            # If you try to treat this as a UTF-8 string it throws an error.
-            # json.loads(r'"\ud83d\ude09"') <- this works
-            # "\ud83d\ude09".encode('utf8') <- this throws an error
-    for g in all_graphs:
-        gg = H(g)
-        MAP_OUT_FILE.write(f"{gg}\t|\t{g}\n")
-
-    TRIPLE_OUT_FILE.close()
-    MAP_OUT_FILE.close()
-
-    DB_SCHEMA = """
-    create table if not exists literals (hash ubigint, value varchar);
-    create table if not exists iris (hash ubigint, value varchar);
-    create table if not exists triples (s ubigint, p ubigint, o ubigint, g ubigint);    
-    """
-
-    db_connection.execute(DB_SCHEMA)
-    db_connection.execute(
-        rf"insert into triples(s,p,o,g) select ('0x' || column0).lower()::ubigint, ('0x' || column1).lower()::ubigint, ('0x' || column2).lower()::ubigint, ('0x' || column3).lower()::ubigint from read_csv('{TRIPLE_PATH}', delim='\t', header=false)"
-    )
-    db_connection.execute(
-        rf"""insert into literals select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) = '"' group by column0 order by column0 """
-    )
-
-    db_connection.execute(
-        rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
-    )
-    db_connection.execute(
-        f"pragma create_fts_index('literals', 'hash', 'value', stemmer='{stemmer}')"
-    )
-    db_connection.commit()
-
-    os.unlink(TRIPLE_PATH)
-    os.unlink(MAP_PATH)
-
-
-####################################################################################
-####################################################################################
-####################################################################################
+def raw():
+    DB = duckdb.connect(DB_PATH, read_only=True)
+    return DB.cursor()
 
 
 def q_to_sql(query: dict):
@@ -229,6 +33,8 @@ def q_to_sql(query: dict):
         g_hashes = ", ".join([f"'0x{ggg}'::ubigint" for ggg in gg])
         extra_g = f" and T0.g in ({g_hashes})"
 
+    extra_fts_fields = query.get("_extra_fts_fields", "")
+
     if p == "" and o.startswith("<"):
         return f"(select distinct s from triples T0 where o{oo} {extra_g})"
     elif p == "id":
@@ -243,6 +49,11 @@ def q_to_sql(query: dict):
                     o_count = 1
             return f"(select distinct s from triples using sample {o_count} {extra_g})"
         return f"(select distinct s from triples where s{oo} {extra_g})"
+    elif p.startswith("semantic"):
+        # convert the o to a vector
+        q_vector = get_embedding(o)
+        return f"""(select distinct s{extra_fts_fields} from (select T0.s, array_cosine_distance(vec, CAST({q_vector} AS FLOAT[{VEC_DIM}])) as distance, 1/distance as score from literals_semantic LS join triples T0 on T0.s = LS.hash where distance < 0.5 {extra_g}))
+        """
 
     elif p.startswith("regex"):
         parts = p.split(" ")
@@ -254,6 +65,10 @@ def q_to_sql(query: dict):
                 extra = f" and T.p = '0x{p_property_hash}'::ubigint"
         psql = f"select distinct T.s from triples T join literals L on T.o = L.hash where L.value similar to '{o}'{extra} {extra_g}"
         return psql
+    elif p.startswith("ftss"):
+        psql = f"""(with scored as (select *, fts_main_fts.match_bm25(s, '{o}', conjunctive:=1) AS score from fts)
+select s{extra_fts_fields} from scored where score is not null"""
+        return f"{psql} {extra_g} )"
     elif p.startswith("fts"):
         parts = p.split(" ")
         parents = 0
@@ -271,7 +86,6 @@ def q_to_sql(query: dict):
         else:
             extra = ""
 
-        extra_fts_fields = query.get("_extra_fts_fields", "")
         psql = f"""(with scored as (select *, fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score from literals)
     select distinct T{parents}.s{extra_fts_fields} from (select * from scored where score is not null) S join triples T0
     on S.hash = T0.o
@@ -302,7 +116,9 @@ def query(opts):
 
     for query in opts.get("filters", []):
         op = query.get("op", "should")
-        if str(query.get("p")).startswith("fts"):
+        if str(query.get("p")).startswith("fts") or str(query.get("p")).startswith(
+            "semantic"
+        ):
             fts_query = query.copy()
             fts_query["_extra_fts_fields"] = ", score "
             if not fts_for_sorting:
@@ -327,6 +143,7 @@ def query(opts):
     queries.extend(queries_except)
     queries = list(filter(None, queries))
 
+    DB = duckdb.connect(DB_PATH, read_only=True)
     db_cursor = DB.cursor()
     total = 0
     tofetch = set()
@@ -478,22 +295,3 @@ select source, path from hier where source in (select s from s_results)
         back["aggregates"] = aggregates_mapped
 
     return back
-
-
-def check_suffix(filename):
-    for suffix in (".gz", ".nt", ".trig"):
-        if filename.endswith(suffix):
-            return True
-    return False
-
-
-if __name__ == "__main__":
-    if check_suffix(sys.argv[1]):
-        build_bikidata([sys.argv[1]], DB.cursor())
-    else:
-        filepaths = [
-            os.path.join(sys.argv[1], x)
-            for x in os.listdir(sys.argv[1])
-            if check_suffix(x)
-        ]
-        build_bikidata(filepaths, DB.cursor())
