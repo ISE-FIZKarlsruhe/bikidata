@@ -35,7 +35,7 @@ def q_to_sql(query: dict):
 
     extra_fts_fields = query.get("_extra_fts_fields", "")
 
-    if p == "" and o.startswith("<"):
+    if p == "" and (o.startswith("<") or o.startswith("_:")):
         return f"(select distinct s from triples T0 where o{oo} {extra_g})"
     elif p == "id":
         if o.startswith("random") or o.startswith("sample"):
