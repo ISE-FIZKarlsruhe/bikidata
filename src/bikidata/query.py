@@ -114,6 +114,8 @@ def query(opts):
     # but we can not control how users specify them, they might be added first
     fts_for_sorting = []
 
+    exclude_properties = opts.get("exclude_properties", [])
+
     for query in opts.get("filters", []):
         op = query.get("op", "should")
         if str(query.get("p")).startswith("fts") or str(query.get("p")).startswith(
@@ -191,8 +193,22 @@ def query(opts):
             aggregates[agg] = aggs
 
         if wanted.shape[0] > 0:
+
             s_ids = ", ".join([str(row["s"]) for index, row in wanted.iterrows()])
-            s_ids_q = f"select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s in ({s_ids})"
+            if len(exclude_properties) > 0:
+                exclude_properties_list = ",".join(
+                    [f"'{ep}'" for ep in exclude_properties]
+                )
+                # exclude_properties_hashes = [
+                #     row[0]
+                #     for row in db_cursor.execute(
+                #         f"select hash from iris where value in ({exclude_properties_list})"
+                #     ).fetchall()
+                # ]
+                s_ids_q = f"""with excl_props as (select hash from iris where value in ({exclude_properties_list}))
+select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s in ({s_ids}) and T.p not in (select hash from excl_props)"""
+            else:
+                s_ids_q = f"select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s in ({s_ids})"
             triples = db_cursor.execute(s_ids_q).df()
 
             for index, row in triples.iterrows():
