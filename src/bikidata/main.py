@@ -107,7 +107,8 @@ def read_nt(triplefile_paths: list):
                 o = " ".join(parts[2:])
 
             if not (s.startswith("<") and s.endswith(">")):
-                continue
+                if not s.startswith("_:"):
+                    continue
             if not (p.startswith("<") and p.endswith(">")):
                 continue
 

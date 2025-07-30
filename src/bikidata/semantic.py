@@ -6,7 +6,10 @@ import cohere
 VEC_DIM = 1024
 
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
-co = cohere.ClientV2(COHERE_API_KEY)
+if not COHERE_API_KEY:
+    log.error("COHERE_API_KEY environment variable is not set. ")
+else:
+    co = cohere.ClientV2(COHERE_API_KEY)
 
 
 def get_embedding(text: str) -> list:

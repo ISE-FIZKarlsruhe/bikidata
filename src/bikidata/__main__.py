@@ -1,5 +1,5 @@
 import os, sys
-from .main import DB, build
+from .main import build
 
 
 def check_suffix(filename):
@@ -10,9 +10,9 @@ def check_suffix(filename):
 
 
 if check_suffix(sys.argv[1]):
-    build([sys.argv[1]], DB.cursor())
+    build([sys.argv[1]])
 else:
     filepaths = [
         os.path.join(sys.argv[1], x) for x in os.listdir(sys.argv[1]) if check_suffix(x)
     ]
-    build(filepaths, DB.cursor())
+    build(filepaths)
