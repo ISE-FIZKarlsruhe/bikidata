@@ -1,4 +1,4 @@
-# Bikidata
+# bikiDATA
 
 ## Developer-friendly Queries over RDF triples
 
