@@ -9,6 +9,61 @@ def raw():
     return DB.cursor()
 
 
+def total():
+    DB = duckdb.connect(DB_PATH, read_only=True)
+    db_cursor = DB.cursor()
+    total = db_cursor.execute("select count(distinct s) from triples").fetchone()[0]
+    return total
+
+
+def properties():
+    """
+    Returns a list of all properties in the database.
+    """
+    SQL = "select distinct I.value, count(distinct s) from triples T join iris I on T.p = I.hash group by I.value"
+    DB = duckdb.connect(DB_PATH, read_only=True)
+    db_cursor = DB.cursor()
+    return dict(db_cursor.execute(SQL).fetchall())
+
+
+def count_by_property(property):
+    SQL = "select I.value, count(distinct s) from triples T join iris I on T.o = I.hash join iris II on T.p = II.hash where II.value = ? group by I.value"
+    DB = duckdb.connect(DB_PATH, read_only=True)
+    db_cursor = DB.cursor()
+
+    return dict(db_cursor.execute(SQL, (property,)).fetchall())
+
+
+def spo(*args, **kwargs):
+    """
+    Returns triples with the given subject, predicate, and object.
+    """
+    vals = {}
+    for i, t in enumerate(args):
+        if t is not None:
+            if not isinstance(t, str):
+                raise TypeError("s, p, and o must be strings or None")
+            vals[i] = xxhash.xxh64_hexdigest(t).lower() if t else None
+
+    conditions = []
+    for i, t in enumerate(("s", "p", "o", "g")):
+        tt = vals.get(i)
+        if tt:
+            conditions.append(f"{t} = '0x{tt}'::ubigint")
+
+    size = kwargs.get("size", 1000)
+    start = kwargs.get("start", 0)
+    start = "" if start == 0 else f" offset {start}"
+
+    conditions_ = " and ".join(conditions)
+    where = f" where {conditions_}" if conditions_ else ""
+    SQL = f"select U.value, UU.value, UUU.value, L.value from triples T left join iris U on T.s = U.hash left join iris UU on T.p = UU.hash left join iris UUU on T.o = UUU.hash left join literals L on T.o = L.hash{where}{start} limit {size}"
+
+    DB = duckdb.connect(DB_PATH, read_only=True)
+    db_cursor = DB.cursor()
+    return [(s, p, o if o else oo) for s, p, o, oo in db_cursor.execute(SQL).fetchall()]
+
+
 def q_to_sql(query: dict):
     p = str(query.get("p", "")).strip(" ")
     o = str(query.get("o", "")).strip(" ")
