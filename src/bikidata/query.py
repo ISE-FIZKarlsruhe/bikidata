@@ -154,6 +154,234 @@ select s{extra_fts_fields} from scored where score is not null"""
             return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint {extra_g})"
 
 
+# --- ADDED: sort-api (helpers) ---
+RDFS_LABEL_IRI = "<http://www.w3.org/2000/01/rdf-schema#label>"
+
+def _iri_hex(iri: str) -> str:
+    """Return SQL ubigint literal for a given IRI using the same xxhash64 scheme."""
+    h = xxhash.xxh64_hexdigest(iri).lower()
+    return f"'0x{h}'::ubigint"
+
+def _normalize_order_rules(order_rules):
+    """Accept dict | [dict] | [[dict]] and return a flat [dict] list."""
+    if not order_rules:
+        return []
+    if isinstance(order_rules, dict):
+        return [order_rules]
+    if isinstance(order_rules, list) and order_rules and isinstance(order_rules[0], list):
+        return order_rules[0]
+    return order_rules
+
+def _lang_case_sql(val_expr: str, langs: list[str]) -> str:
+    """
+    Build a CASE expression to rank labels by language preference.
+    val_expr should be a column like L.value (e.g. '"Text"@de').
+    """
+    parts = []
+    rank = 1
+    for lg in (langs or []):
+        parts.append(f"WHEN {val_expr} LIKE '%\"@{lg}' THEN {rank}")
+        rank += 1
+    parts.append(f"WHEN {val_expr} NOT LIKE '%\"@%' THEN {rank}")
+    rank += 1
+    parts.append(f"ELSE {rank}")
+    return "CASE " + " ".join(parts) + " END"
+
+def _build_clean_expr(base_expr: str, clean: dict, mode: str) -> str:
+    """
+    Build SQL expression for sorting ('sort_label') based on cleaning config.
+    base_expr is the raw label text WITHOUT @lang (e.g. regexp_extract(...)).
+    mode: 'lex' (case-insensitive, normalized) or 'raw' (original string, unless flags set).
+    clean: {lower, trim, strip_punct, collapse_space, remove_quotes}
+    """
+    expr = base_expr
+    c = clean or {}
+    # Optional: remove surrounding quotes if still present
+    if c.get("remove_quotes", False):
+        expr = f"regexp_replace({expr}, '^\"|\"$', '')"
+    # Collapse multiple whitespace
+    if c.get("collapse_space", False):
+        expr = f"regexp_replace({expr}, '\\s+', ' ')"
+    # Strip leading punctuation / non-alnum
+    if c.get("strip_punct", False):
+        expr = f"regexp_replace({expr}, '^[^0-9A-Za-z]+', '')"
+    # Trim
+    if c.get("trim", True):
+        expr = f"trim({expr})"
+    # Lowercase for lexicographic stability
+    if mode == "lex" and c.get("lower", True):
+        expr = f"lower({expr})"
+    return expr
+
+def _natural_order_block(prefix_alias: str, dir_sql: str) -> str:
+    """
+    Build ORDER BY block that prioritizes numeric leading prefixes when present.
+    prefix_alias: table alias used in SELECT that exposes 'sort_label' (e.g. 'P' or 'N').
+    dir_sql: 'ASC' or 'DESC' for both numeric and string sort.
+    """
+    # We prefer entries WITH a numeric prefix first, then sort by that number,
+    # then tie-break by the normalized/picked sort_label, then by s for stability.
+    return f"""
+ORDER BY
+  sort_label IS NULL ASC,
+  ({prefix_alias}.num_prefix IS NULL),
+  {prefix_alias}.num_prefix {dir_sql},
+  sort_label {dir_sql},
+  S.s
+"""
+
+def _plain_order_block(dir_sql: str, nulls_sql: str) -> str:
+    """Fallback ORDER BY without numeric prefix handling."""
+    return f"""
+ORDER BY
+  {nulls_sql},
+  sort_label {dir_sql},
+  S.s
+"""
+
+def _order_build_sorted_table(db_cursor, order_rules: list):
+    """
+    Create temp table s_sorted(s, sort_label) sorted per the first rule.
+    Supported:
+      {"by":"label","lang":["de","en"],"dir":"asc","nulls":"last",
+       "mode":"lex"|"raw","natural":true|false,
+       "clean":{"trim":true,"lower":true,"strip_punct":true,"collapse_space":true}}
+      {"by":"property","prop":"<IRI>", ...}
+      {"by":"object_label","via":"<IRI>", ...}
+    """
+    if not order_rules:
+        return
+
+    rule = order_rules[0]
+    by = (rule.get("by") or "label").lower()
+    langs = rule.get("lang") or ["de", "en"]
+    direction = (rule.get("dir") or "asc").lower()
+    nulls = (rule.get("nulls") or "last").lower()
+    mode = (rule.get("mode") or "lex").lower()   # 'lex' or 'raw'
+    clean = rule.get("clean") or {"trim": True, "lower": (mode == "lex")}
+    natural = bool(rule.get("natural", False))   # --- ADDED: sort-api (natural numbers) ---
+
+    dir_sql = "ASC" if direction != "desc" else "DESC"
+    nulls_sql = "sort_label IS NULL DESC" if nulls == "first" else "sort_label IS NULL ASC"
+
+    case_expr = _lang_case_sql("L.value", langs)
+    raw_text = 'regexp_extract(L.value, \'^"(.+)"\', 1)'
+    sort_expr = _build_clean_expr(raw_text, clean, mode)
+
+    # Choose post-CTE SELECT and ORDER BY depending on `natural`
+    if natural:
+        post_block = f"""
+, numbered AS (
+    SELECT s,
+           sort_label,
+           TRY_CAST(NULLIF(regexp_extract(sort_label, '^(\\d+)', 1), '') AS INTEGER) AS num_prefix
+    FROM pref
+)
+SELECT S.s, N.sort_label
+FROM s_results S
+LEFT JOIN numbered N ON N.s = S.s
+{_natural_order_block('N', dir_sql)}
+"""
+    else:
+        post_block = f"""
+SELECT S.s, P.sort_label
+FROM s_results S
+LEFT JOIN pref P ON P.s = S.s
+{_plain_order_block(dir_sql, nulls_sql)}
+"""
+
+    if by == "label":
+        prop_sql = _iri_hex(RDFS_LABEL_IRI)
+        db_cursor.execute(f"""
+            create temp table s_sorted as
+            with labels as (
+                select S.s,
+                       L.value as lbl_val,
+                       {case_expr} as lang_rank,
+                       {sort_expr} as sort_label
+                from s_results S
+                join triples T on T.s = S.s and T.p = {prop_sql}
+                join literals L on L.hash = T.o
+            ),
+            pref as (
+                select s, sort_label
+                from (
+                    select s, sort_label, lang_rank,
+                           row_number() over (partition by s order by lang_rank asc, sort_label asc) as rn
+                    from labels
+                )
+                where rn = 1
+            )
+            {post_block}
+        """)
+
+    elif by == "property":
+        prop_iri = rule.get("prop")
+        if not prop_iri:
+            raise ValueError("order.by='property' requires 'prop' (IRI).")
+        prop_sql = _iri_hex(prop_iri)
+        db_cursor.execute(f"""
+            create temp table s_sorted as
+            with labels as (
+                select S.s,
+                       L.value as lbl_val,
+                       {case_expr} as lang_rank,
+                       {sort_expr} as sort_label
+                from s_results S
+                join triples T on T.s = S.s and T.p = {prop_sql}
+                join literals L on L.hash = T.o
+            ),
+            pref as (
+                select s, sort_label
+                from (
+                    select s, sort_label, lang_rank,
+                           row_number() over (partition by s order by lang_rank asc, sort_label asc) as rn
+                    from labels
+                )
+                where rn = 1
+            )
+            {post_block}
+        """)
+
+    elif by == "object_label":
+        via_iri = rule.get("via")
+        if not via_iri:
+            raise ValueError("order.by='object_label' requires 'via' (IRI).")
+        via_sql = _iri_hex(via_iri)
+        rdfs_sql = _iri_hex(RDFS_LABEL_IRI)
+        db_cursor.execute(f"""
+            create temp table s_sorted as
+            with objs as (
+                select S.s, T1.o as obj
+                from s_results S
+                join triples T1 on T1.s = S.s and T1.p = {via_sql}
+            ),
+            olabels as (
+                select O.s,
+                       L.value as lbl_val,
+                       {case_expr} as lang_rank,
+                       {sort_expr} as sort_label
+                from objs O
+                join triples T2 on T2.s = O.obj and T2.p = {rdfs_sql}
+                join literals L on L.hash = T2.o
+            ),
+            pref as (
+                select s, sort_label
+                from (
+                    select s, sort_label, lang_rank,
+                           row_number() over (partition by s order by lang_rank asc, sort_label asc) as rn
+                    from olabels
+                )
+                where rn = 1
+            )
+            {post_block}
+        """)
+
+    else:
+        raise ValueError(f"Unsupported order.by='{by}'")
+# --- END ADDED: sort-api (helpers) ---
+
+
 def query(opts):
     try:
         size = int(opts.get("size", 999))
@@ -170,6 +398,10 @@ def query(opts):
     fts_for_sorting = []
 
     exclude_properties = opts.get("exclude_properties", [])
+
+    # --- ADDED: sort-api (order parse & normalize) ---
+    order_rules = _normalize_order_rules(opts.get("order", []))
+    # --- END ADDED: sort-api ---
 
     for query in opts.get("filters", []):
         op = query.get("op", "should")
@@ -216,26 +448,57 @@ def query(opts):
                 + ") group by s"
             )
             db_cursor.execute(fts_queries_joined)
+            # --- CHANGED: sort-api (remove early ORDER BY; we sort later) ---
             queries_joined = (
                 "create temp table s_results as select distinct QJ.s from ("
                 + "\n".join(queries)
-                + ") QJ left join s_by_score SS on QJ.s = SS.s order by SS.score desc, QJ.s"
+                + ") QJ left join s_by_score SS on QJ.s = SS.s"
             )
+            # --- END CHANGED: sort-api ---
         else:
+            # --- CHANGED: sort-api (remove early ORDER BY; we sort later) ---
             queries_joined = (
                 "create temp table s_results as select distinct s from ("
                 + "\n".join(queries)
-                + ") order by s"
+                + ")"
             )
+            # --- END CHANGED: sort-api ---
 
         db_cursor.execute(queries_joined)
 
-        # calc the total size based on unique s
-        subjects = db_cursor.execute("select s from s_results").df()
-        total = subjects.shape[0]
-        wanted = subjects[start : start + size]
+        # --- ADDED: sort-api (total & wanted page in SQL) ---
+        total = db_cursor.execute("select count(*) from s_results").fetchone()[0]
 
-        # check for aggregates
+        if order_rules:
+            _order_build_sorted_table(db_cursor, order_rules)
+            db_cursor.execute(f"""
+                create temp table wanted as
+                select s, row_number() over () as pos
+                from s_sorted
+                limit {size} offset {start}
+            """)
+        else:
+            if len(fts_for_sorting) > 0:
+                db_cursor.execute(f"""
+                    create temp table wanted as
+                    select QJ.s,
+                           row_number() over () as pos
+                    from s_results QJ
+                    left join s_by_score SS on QJ.s = SS.s
+                    order by SS.score desc, QJ.s
+                    limit {size} offset {start}
+                """)
+            else:
+                db_cursor.execute(f"""
+                    create temp table wanted as
+                    select s, row_number() over () as pos
+                    from s_results
+                    order by s
+                    limit {size} offset {start}
+                """)
+        # --- END ADDED: sort-api ---
+
+        # check for aggregates (computed on full s_results set)
         for agg in opts.get("aggregates", []):
             if agg == "graphs":
                 tmp = f"select distinct count(g) as count, I.value as val from s_results S join triples T on S.s = T.s join iris I on T.g = I.hash group by T.g, I.value"
@@ -247,26 +510,30 @@ def query(opts):
             aggs = db_cursor.execute(tmp).df()
             aggregates[agg] = aggs
 
-        if wanted.shape[0] > 0:
-
-            s_ids = ", ".join([str(row["s"]) for index, row in wanted.iterrows()])
+        # fetch triples for the current page in deterministic order (by wanted.pos)
+        if db_cursor.execute("select count(*) from wanted").fetchone()[0] > 0:
             if len(exclude_properties) > 0:
                 exclude_properties_list = ",".join(
                     [f"'{ep}'" for ep in exclude_properties]
                 )
-                # exclude_properties_hashes = [
-                #     row[0]
-                #     for row in db_cursor.execute(
-                #         f"select hash from iris where value in ({exclude_properties_list})"
-                #     ).fetchall()
-                # ]
-                s_ids_q = f"""with excl_props as (select hash from iris where value in ({exclude_properties_list}))
-select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s in ({s_ids}) and T.p not in (select hash from excl_props)"""
+                s_ids_q = f"""
+                    with excl_props as (select hash from iris where value in ({exclude_properties_list}))
+                    select distinct T.s, T.p, T.o, T.g
+                    from wanted W
+                    join triples T on T.s = W.s
+                    where T.p not in (select hash from excl_props)
+                    order by W.pos
+                """
             else:
-                s_ids_q = f"select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s in ({s_ids})"
+                s_ids_q = """
+                    select distinct T.s, T.p, T.o, T.g
+                    from wanted W
+                    join triples T on T.s = W.s
+                    order by W.pos
+                """
             triples = db_cursor.execute(s_ids_q).df()
 
-            for index, row in triples.iterrows():
+            for _, row in triples.iterrows():
                 r_s = row.get("s")
                 r_p = row.get("p")
                 r_o = row.get("o")
@@ -279,7 +546,7 @@ select distinct T.s,p,o,g from s_results S join triples T on S.s = T.s where S.s
                     results.setdefault(r_s, {}).setdefault("graph", set()).add(r_g)
                 results.setdefault(r_s, {}).setdefault(r_p, set()).add(r_o)
 
-            # Fetch the paths
+            # Fetch the paths (restricted to current page subjects)
             for pad in opts.get("paths", []):
                 padd = xxhash.xxh64_hexdigest(str(pad)).lower()
                 padsql = f"""with recursive parents(s, parent) as 
@@ -293,9 +560,8 @@ hier(source, path) as (
     from parents, hier
     where parent = hier.source
 )
-select source, path from hier where source in (select s from s_results)
+select source, path from hier where source in (select s from wanted)
 """
-                buf = []
                 for _, row in db_cursor.execute(padsql).df().iterrows():
                     padr_s = row.get("source")
                     results.setdefault(padr_s, {}).setdefault("_paths", {})
