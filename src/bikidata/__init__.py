@@ -15,4 +15,13 @@ except:
         "Make sure you have the required dependencies installed and COHERE_API_KEY env var defined."
     )
 
-from .query import spo, query, raw, total, count_by_property, properties
+from .query import (
+    spo,
+    query,
+    raw,
+    total,
+    count_by_property,
+    properties,
+    query_async,
+    TimeoutError,
+)

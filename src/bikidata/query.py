@@ -1,7 +1,15 @@
+import time, json, random, hashlib
 from .semantic import get_embedding, VEC_DIM
 import xxhash
 from .main import DB_PATH, log
 import duckdb
+
+try:
+    import redis.asyncio as redis
+
+    redis_client = redis.Redis()
+except:
+    log.warning("Redis not available, async queries will not work")
 
 
 def raw():
@@ -157,10 +165,12 @@ select s{extra_fts_fields} from scored where score is not null"""
 # --- ADDED: sort-api (helpers) ---
 RDFS_LABEL_IRI = "<http://www.w3.org/2000/01/rdf-schema#label>"
 
+
 def _iri_hex(iri: str) -> str:
     """Return SQL ubigint literal for a given IRI using the same xxhash64 scheme."""
     h = xxhash.xxh64_hexdigest(iri).lower()
     return f"'0x{h}'::ubigint"
+
 
 def _normalize_order_rules(order_rules):
     """Accept dict | [dict] | [[dict]] and return a flat [dict] list."""
@@ -168,9 +178,14 @@ def _normalize_order_rules(order_rules):
         return []
     if isinstance(order_rules, dict):
         return [order_rules]
-    if isinstance(order_rules, list) and order_rules and isinstance(order_rules[0], list):
+    if (
+        isinstance(order_rules, list)
+        and order_rules
+        and isinstance(order_rules[0], list)
+    ):
         return order_rules[0]
     return order_rules
+
 
 def _lang_case_sql(val_expr: str, langs: list[str]) -> str:
     """
@@ -179,13 +194,14 @@ def _lang_case_sql(val_expr: str, langs: list[str]) -> str:
     """
     parts = []
     rank = 1
-    for lg in (langs or []):
+    for lg in langs or []:
         parts.append(f"WHEN {val_expr} LIKE '%\"@{lg}' THEN {rank}")
         rank += 1
     parts.append(f"WHEN {val_expr} NOT LIKE '%\"@%' THEN {rank}")
     rank += 1
     parts.append(f"ELSE {rank}")
     return "CASE " + " ".join(parts) + " END"
+
 
 def _build_clean_expr(base_expr: str, clean: dict, mode: str) -> str:
     """
@@ -213,6 +229,7 @@ def _build_clean_expr(base_expr: str, clean: dict, mode: str) -> str:
         expr = f"lower({expr})"
     return expr
 
+
 def _natural_order_block(prefix_alias: str, dir_sql: str) -> str:
     """
     Build ORDER BY block that prioritizes numeric leading prefixes when present.
@@ -230,6 +247,7 @@ ORDER BY
   S.s
 """
 
+
 def _plain_order_block(dir_sql: str, nulls_sql: str) -> str:
     """Fallback ORDER BY without numeric prefix handling."""
     return f"""
@@ -238,6 +256,7 @@ ORDER BY
   sort_label {dir_sql},
   S.s
 """
+
 
 def _order_build_sorted_table(db_cursor, order_rules: list):
     """
@@ -257,15 +276,19 @@ def _order_build_sorted_table(db_cursor, order_rules: list):
     langs = rule.get("lang") or ["de", "en"]
     direction = (rule.get("dir") or "asc").lower()
     nulls = (rule.get("nulls") or "last").lower()
-    mode = (rule.get("mode") or "lex").lower()   # 'lex' or 'raw'
+    mode = (rule.get("mode") or "lex").lower()  # 'lex' or 'raw'
     clean = rule.get("clean") or {"trim": True, "lower": (mode == "lex")}
-    natural = bool(rule.get("natural", False))   # --- ADDED: sort-api (natural numbers) ---
+    natural = bool(
+        rule.get("natural", False)
+    )  # --- ADDED: sort-api (natural numbers) ---
 
     dir_sql = "ASC" if direction != "desc" else "DESC"
-    nulls_sql = "sort_label IS NULL DESC" if nulls == "first" else "sort_label IS NULL ASC"
+    nulls_sql = (
+        "sort_label IS NULL DESC" if nulls == "first" else "sort_label IS NULL ASC"
+    )
 
     case_expr = _lang_case_sql("L.value", langs)
-    raw_text = 'regexp_extract(L.value, \'^"(.+)"\', 1)'
+    raw_text = "regexp_extract(L.value, '^\"(.+)\"', 1)"
     sort_expr = _build_clean_expr(raw_text, clean, mode)
 
     # Choose post-CTE SELECT and ORDER BY depending on `natural`
@@ -292,7 +315,8 @@ LEFT JOIN pref P ON P.s = S.s
 
     if by == "label":
         prop_sql = _iri_hex(RDFS_LABEL_IRI)
-        db_cursor.execute(f"""
+        db_cursor.execute(
+            f"""
             create temp table s_sorted as
             with labels as (
                 select S.s,
@@ -313,14 +337,16 @@ LEFT JOIN pref P ON P.s = S.s
                 where rn = 1
             )
             {post_block}
-        """)
+        """
+        )
 
     elif by == "property":
         prop_iri = rule.get("prop")
         if not prop_iri:
             raise ValueError("order.by='property' requires 'prop' (IRI).")
         prop_sql = _iri_hex(prop_iri)
-        db_cursor.execute(f"""
+        db_cursor.execute(
+            f"""
             create temp table s_sorted as
             with labels as (
                 select S.s,
@@ -341,7 +367,8 @@ LEFT JOIN pref P ON P.s = S.s
                 where rn = 1
             )
             {post_block}
-        """)
+        """
+        )
 
     elif by == "object_label":
         via_iri = rule.get("via")
@@ -349,7 +376,8 @@ LEFT JOIN pref P ON P.s = S.s
             raise ValueError("order.by='object_label' requires 'via' (IRI).")
         via_sql = _iri_hex(via_iri)
         rdfs_sql = _iri_hex(RDFS_LABEL_IRI)
-        db_cursor.execute(f"""
+        db_cursor.execute(
+            f"""
             create temp table s_sorted as
             with objs as (
                 select S.s, T1.o as obj
@@ -375,11 +403,55 @@ LEFT JOIN pref P ON P.s = S.s
                 where rn = 1
             )
             {post_block}
-        """)
+        """
+        )
 
     else:
         raise ValueError(f"Unsupported order.by='{by}'")
+
+
 # --- END ADDED: sort-api (helpers) ---
+
+
+async def redis_worker():
+    log.debug("Entering worker loop, using Redis")
+    while True:
+        _, serial_query = await redis_client.blpop("bikidata:queries")
+        opts = json.loads(serial_query)
+        query_hash = opts.get("query_hash")
+        query_ticket = opts.get("query_ticket")
+        if not query_ticket:
+            log.error("No query ticket found in query")
+            continue
+        cached = await redis_client.get(query_hash)
+        if cached:
+            log.debug(f"Cache hit for query ticket {query_ticket}")
+            result = json.loads(cached)
+        else:
+            log.debug(f"Processing query ticket {query_ticket}")
+            result = query(opts)
+            await redis_client.set(query_hash, json.dumps(result), ex=60 * 60 * 24 * 7)
+        await redis_client.lpush(query_ticket, json.dumps(result))
+
+
+class TimeoutError(Exception):
+    pass
+
+
+async def query_async(opts: dict):
+    query_ticket = f"{time.time()}-{random.randint(0,1000000)}"
+    query_hash = hashlib.md5(
+        json.dumps(opts, sort_keys=True).encode("utf8")
+    ).hexdigest()
+    opts["query_ticket"] = query_ticket
+    opts["query_hash"] = query_hash
+    serial_query = json.dumps(opts)
+    await redis_client.lpush("bikidata:queries", serial_query)
+    popresult = await redis_client.blpop(query_ticket, timeout=60)
+    if popresult is None:
+        raise TimeoutError("Query timed out")
+    _, result = popresult
+    return json.loads(result)
 
 
 def query(opts):
@@ -471,15 +543,18 @@ def query(opts):
 
         if order_rules:
             _order_build_sorted_table(db_cursor, order_rules)
-            db_cursor.execute(f"""
+            db_cursor.execute(
+                f"""
                 create temp table wanted as
                 select s, row_number() over () as pos
                 from s_sorted
                 limit {size} offset {start}
-            """)
+            """
+            )
         else:
             if len(fts_for_sorting) > 0:
-                db_cursor.execute(f"""
+                db_cursor.execute(
+                    f"""
                     create temp table wanted as
                     select QJ.s,
                            row_number() over () as pos
@@ -487,15 +562,18 @@ def query(opts):
                     left join s_by_score SS on QJ.s = SS.s
                     order by SS.score desc, QJ.s
                     limit {size} offset {start}
-                """)
+                """
+                )
             else:
-                db_cursor.execute(f"""
+                db_cursor.execute(
+                    f"""
                     create temp table wanted as
                     select s, row_number() over () as pos
                     from s_results
                     order by s
                     limit {size} offset {start}
-                """)
+                """
+                )
         # --- END ADDED: sort-api ---
 
         # check for aggregates (computed on full s_results set)
