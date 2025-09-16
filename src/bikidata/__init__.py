@@ -17,6 +17,7 @@ except:
 
 from .query import (
     spo,
+    sp,
     query,
     raw,
     total,
