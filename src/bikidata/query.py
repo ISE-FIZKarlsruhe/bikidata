@@ -1,4 +1,4 @@
-import time, json, random, hashlib
+import time, json, random, hashlib, os
 from .semantic import get_embedding, VEC_DIM
 import xxhash
 from .main import DB_PATH, log
@@ -7,7 +7,8 @@ import duckdb
 try:
     import redis.asyncio as redis
 
-    redis_client = redis.Redis()
+    REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+    redis_client = redis.Redis(host=REDIS_HOST)
 except:
     log.warning("Redis not available, async queries will not work")
 
@@ -40,6 +41,28 @@ def count_by_property(property):
     db_cursor = DB.cursor()
 
     return dict(db_cursor.execute(SQL, (property,)).fetchall())
+
+
+def sp(s: list[str], p: str | None):
+    "For a list of subjects s,  and a predicates p, return the triples where s and p match"
+    if not isinstance(s, list):
+        raise TypeError("s must be a list of strings")
+    ss = [xxhash.xxh64_hexdigest(x).lower() for x in s]
+    sss = ",".join(f"'0x{x}'::ubigint" for x in ss)
+    where = (
+        f"where U.hash in ({sss}) and UU.hash = '0x{xxhash.xxh64_hexdigest(p).lower()}'::ubigint"
+        if p
+        else f"where U.hash in ({sss})"
+    )
+
+    SQL = f"select U.value, UU.value, UUU.value, L.value from triples T left join iris U on T.s = U.hash left join iris UU on T.p = UU.hash left join iris UUU on T.o = UUU.hash left join literals L on T.o = L.hash {where}"
+
+    DB = duckdb.connect(DB_PATH, read_only=True)
+    db_cursor = DB.cursor()
+    data = {}
+    for s, p, o, oo in db_cursor.execute(SQL).fetchall():
+        data.setdefault(s, []).append(o if o else oo)
+    return data
 
 
 def spo(*args, **kwargs):
