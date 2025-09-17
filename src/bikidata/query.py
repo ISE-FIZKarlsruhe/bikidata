@@ -72,6 +72,39 @@ def spo(*args, **kwargs):
     return [(s, p, o if o else oo) for s, p, o, oo in db_cursor.execute(SQL).fetchall()]
 
 
+def parse_hops_and_prop(p_str: str) -> tuple[int, str | None]:
+    """
+    Parse patterns like:
+      'fts', 'fts 1', 'fts <iri>', 'fts 2 <iri>'
+      'regex', 'regex 1', 'regex <iri>', 'regex 2 <iri>'
+    Returns (hops, prop_iri_or_none).
+    """
+    toks = (p_str or "").split()
+    hops = 0
+    prop = None
+    if len(toks) >= 2:
+        if toks[1].isdigit():
+            hops = int(toks[1])
+            if len(toks) >= 3 and toks[2].startswith("<") and toks[2].endswith(">"):
+                prop = toks[2]
+        elif toks[1].startswith("<") and toks[1].endswith(">"):
+            prop = toks[1]
+    return hops, prop
+
+
+def join_parents_sql(hops: int) -> str:
+    """
+    Build the 'parents' join chain:
+      T0 ... join T1 on T0.s = T1.o ... join Tn on T{n-1}.s = Tn.o
+    """
+    if hops <= 0:
+        return ""
+    return "\n".join(
+        f"join triples T{idx+1} on T{idx}.s = T{idx+1}.o"
+        for idx in range(hops)
+    )
+
+
 def q_to_sql(query: dict):
     p = str(query.get("p", "")).strip(" ")
     o = str(query.get("o", "")).strip(" ")
@@ -119,41 +152,46 @@ def q_to_sql(query: dict):
         """
 
     elif p.startswith("regex"):
-        parts = p.split(" ")
-        extra = ""
-        if len(parts) == 2:
-            p, p_property = parts
-            if p_property[0] == "<" and p_property[-1] == ">":
-                p_property_hash = xxhash.xxh64_hexdigest(p_property).lower()
-                extra = f" and T.p = '0x{p_property_hash}'::ubigint"
-        psql = f"select distinct T.s from triples T join literals L on T.o = L.hash where L.value similar to '{o}'{extra} {extra_g}"
+        parents, p_property = parse_hops_and_prop(p)
+        prop_filter = ""
+        if p_property:
+            p_property_hash = xxhash.xxh64_hexdigest(p_property).lower()
+            prop_filter = f" and T0.p = '0x{p_property_hash}'::ubigint"
+
+        joins = join_parents_sql(parents)
+        psql = f"""(
+            select distinct T{parents}.s
+            from triples T0
+            join literals L on T0.o = L.hash
+            {joins}
+            where L.value similar to '{o}'{prop_filter}{extra_g}
+        )"""
         return psql
-    elif p.startswith("ftss"):
-        psql = f"""(with scored as (select *, fts_main_fts.match_bm25(s, '{o}', conjunctive:=1) AS score from fts)
-select s{extra_fts_fields} from scored where score is not null"""
-        return f"{psql} {extra_g} )"
     elif p.startswith("fts"):
-        parts = p.split(" ")
-        parents = 0
-        if len(parts) == 2:
-            p, parents = parts
-            try:
-                parents = int(parents)
-            except ValueError:
-                parents = 0
+        parents, p_property = parse_hops_and_prop(p)
 
-        if parents > 0:
-            extra = "\n".join(
-                [f" join triples T{p+1} on T{p}.s = T{p+1}.o" for p in range(parents)]
+        # parents-join chain (parents >= 1 travels up to ancestors)
+        joins = join_parents_sql(parents)
+
+        # optional restriction to a specific child literal property
+        prop_filter = ""
+        if p_property:
+            p_property_hash = xxhash.xxh64_hexdigest(p_property).lower()
+            prop_filter = f" and T0.p = '0x{p_property_hash}'::ubigint"
+
+        psql = f"""(
+            with scored as (
+                select *,
+                       fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score
+                from literals
             )
-        else:
-            extra = ""
-
-        psql = f"""(with scored as (select *, fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score from literals)
-    select distinct T{parents}.s{extra_fts_fields} from (select * from scored where score is not null) S join triples T0
-    on S.hash = T0.o
-    """
-        return f"{psql} {extra} {extra_g} )"
+            select distinct T{parents}.s{extra_fts_fields}
+            from (select * from scored where score is not null) S
+            join triples T0 on S.hash = T0.o
+            {joins}
+            where 1=1{prop_filter}{extra_g}
+        )"""
+        return psql
 
     elif p[0] == "<" and p[-1] == ">":
         if o:
@@ -162,7 +200,6 @@ select s{extra_fts_fields} from scored where score is not null"""
             return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint {extra_g})"
 
 
-# --- ADDED: sort-api (helpers) ---
 RDFS_LABEL_IRI = "<http://www.w3.org/2000/01/rdf-schema#label>"
 
 
@@ -408,9 +445,6 @@ LEFT JOIN pref P ON P.s = S.s
 
     else:
         raise ValueError(f"Unsupported order.by='{by}'")
-
-
-# --- END ADDED: sort-api (helpers) ---
 
 
 async def redis_worker():
