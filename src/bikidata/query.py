@@ -4,13 +4,15 @@ import xxhash
 from .main import DB_PATH, log
 import duckdb
 
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+log.debug("Trying Redis at " + REDIS_HOST)
+
 try:
     import redis.asyncio as redis
 
-    REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
     redis_client = redis.Redis(host=REDIS_HOST)
 except:
-    log.warning("Redis not available, async queries will not work")
+    log.exception(f"Redis at {REDIS_HOST} not available, async queries will not work")
 
 
 def raw():
