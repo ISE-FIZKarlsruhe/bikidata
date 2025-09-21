@@ -100,7 +100,7 @@ def parse_hops_and_prop(p_str: str) -> tuple[int, str | None]:
     Parse patterns like:
       'fts', 'fts 1', 'fts <iri>', 'fts 2 <iri>'
       'regex', 'regex 1', 'regex <iri>', 'regex 2 <iri>'
-    Returns (hops, prop_iri_or_none).
+    Returns (hops, prop_iri_or_none, p_without_hop).
     """
     toks = (p_str or "").split()
     hops = 0
@@ -112,7 +112,7 @@ def parse_hops_and_prop(p_str: str) -> tuple[int, str | None]:
                 prop = toks[2]
         elif toks[1].startswith("<") and toks[1].endswith(">"):
             prop = toks[1]
-    return hops, prop
+    return hops, prop, toks[0]
 
 
 def join_parents_sql(hops: int) -> str:
@@ -123,8 +123,7 @@ def join_parents_sql(hops: int) -> str:
     if hops <= 0:
         return ""
     return "\n".join(
-        f"join triples T{idx+1} on T{idx}.s = T{idx+1}.o"
-        for idx in range(hops)
+        f"join triples T{idx+1} on T{idx}.s = T{idx+1}.o" for idx in range(hops)
     )
 
 
@@ -132,7 +131,11 @@ def q_to_sql(query: dict):
     p = str(query.get("p", "")).strip(" ")
     o = str(query.get("o", "")).strip(" ")
     g = str(query.get("g", "")).strip(" ")
-    pp = xxhash.xxh64_hexdigest(p).lower()
+
+    # Allow adding an n-hop to the p, e.g. "<iri> 2"
+    # If the p has a space in it, the second part is an n-hop and should be removed
+    parents, p_property, p_without_hop = parse_hops_and_prop(p)
+    pp = xxhash.xxh64_hexdigest(p_without_hop).lower()
 
     gg = [xxhash.xxh64_hexdigest(g_).lower() for g_ in g.split(" ")]
 
@@ -175,7 +178,6 @@ def q_to_sql(query: dict):
         """
 
     elif p.startswith("regex"):
-        parents, p_property = parse_hops_and_prop(p)
         prop_filter = ""
         if p_property:
             p_property_hash = xxhash.xxh64_hexdigest(p_property).lower()
@@ -191,7 +193,6 @@ def q_to_sql(query: dict):
         )"""
         return psql
     elif p.startswith("fts"):
-        parents, p_property = parse_hops_and_prop(p)
 
         # parents-join chain (parents >= 1 travels up to ancestors)
         joins = join_parents_sql(parents)
@@ -216,11 +217,13 @@ def q_to_sql(query: dict):
         )"""
         return psql
 
-    elif p[0] == "<" and p[-1] == ">":
+    elif p[0] == "<":
+        joins = join_parents_sql(parents)
+
         if o:
-            return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint and o{oo} {extra_g})"
+            return f"(select distinct T{parents}.s from triples T0 {joins} where T0.p = '0x{pp}'::ubigint and o{oo} {extra_g})"
         else:
-            return f"(select distinct s from triples T0 where p = '0x{pp}'::ubigint {extra_g})"
+            return f"(select distinct T{parents}.s from triples T0 {joins} where T0.p = '0x{pp}'::ubigint {extra_g})"
 
 
 RDFS_LABEL_IRI = "<http://www.w3.org/2000/01/rdf-schema#label>"
