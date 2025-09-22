@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "bikidata"
-version = "0.3.4"
+version = "0.3.5"
 description = "Developer-friendly Queries over RDF triples"
 authors = ["Etienne Posthumus <ep@epoz.org>"]
 license = "MIT"
