@@ -223,7 +223,7 @@ def q_to_sql(query: dict):
         joins = join_parents_sql(parents)
 
         if o:
-            return f"(select distinct T{parents}.s from triples T0 {joins} where T0.p = '0x{pp}'::ubigint and o{oo} {extra_g})"
+            return f"(select distinct T{parents}.s from triples T0 {joins} where T0.p = '0x{pp}'::ubigint and T0.o{oo} {extra_g})"
         else:
             return f"(select distinct T{parents}.s from triples T0 {joins} where T0.p = '0x{pp}'::ubigint {extra_g})"
 
