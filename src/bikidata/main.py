@@ -202,8 +202,21 @@ def build_from_iterator(iterator, stemmer: str = "porter"):
     db_connection.execute(
         rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
+
+    # We want to allow users to over-ride the FTS settings via environment variable config
+    BIKIDATA_FTS_SETTINGS = os.environ.get("BIKIDATA_FTS_SETTINGS")
+    if BIKIDATA_FTS_SETTINGS:
+        log.debug(f"Using BIKIDATA_FTS_SETTINGS: {BIKIDATA_FTS_SETTINGS}")
+    else:
+        BIKIDATA_FTS_SETTINGS = (
+            f"ignore = '[^a-zA-Z0-9]+', strip_accents = 1, lower=1, stemmer='{stemmer}'"
+        )
+        log.info(
+            f"No BIKIDATA_FTS_SETTINGS found, using default settings: {BIKIDATA_FTS_SETTINGS}"
+        )
+
     db_connection.execute(
-        f"pragma create_fts_index('literals', 'hash', 'value', stemmer='{stemmer}')"
+        f"pragma create_fts_index('literals', 'hash', 'value', {BIKIDATA_FTS_SETTINGS})"
     )
     db_connection.commit()
 
