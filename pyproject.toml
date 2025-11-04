@@ -1,23 +1,23 @@
-[tool.poetry]
+[project]
 name = "bikidata"
-version = "0.3.5"
+version = "0.3.7"
 description = "Developer-friendly Queries over RDF triples"
-authors = ["Etienne Posthumus <ep@epoz.org>"]
-license = "MIT"
+authors = [
+    {name = "Etienne Posthumus", email = "ep@epoz.org"}
+]
+license = {text = "MIT"}
 readme = "README.md"
-homepage = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
-repository = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
 keywords = ["search", "RDF", "Linked Data"]
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.3.2",
+    "numpy>=2.2.4",
+    "xxhash>=3.5.0",
+    "pandas>=2.2.3",
+    "cohere==5.15.0",
+    "redis>=6.4.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-duckdb = "1.3.2"
-numpy = "^2.2.4"
-xxhash = "^3.5.0"
-pandas = "^2.2.3"
-cohere = "5.15.0"
-redis = "^6.4.0"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[project.urls]
+Homepage = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
+Repository = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
