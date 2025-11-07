@@ -114,7 +114,7 @@ def parse_hops_and_prop(p_str: str) -> tuple[int, str | None]:
                 prop = toks[2]
         elif toks[1].startswith("<") and toks[1].endswith(">"):
             prop = toks[1]
-    return hops, prop, toks[0]
+    return hops, prop, toks[0] if toks else ""
 
 
 def join_parents_sql(hops: int) -> str:
