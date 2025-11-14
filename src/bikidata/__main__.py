@@ -1,6 +1,6 @@
 import os, sys
 from .main import build
-from .query import redis_worker
+from .workers import redis_worker, redis_manager
 import asyncio
 
 
@@ -13,6 +13,9 @@ def check_suffix(filename):
 
 if sys.argv[1] == "worker":
     asyncio.run(redis_worker())
+    sys.exit(0)
+if sys.argv[1] == "manager":
+    asyncio.run(redis_manager())
     sys.exit(0)
 
 if check_suffix(sys.argv[1]):

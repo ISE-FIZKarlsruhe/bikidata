@@ -23,6 +23,6 @@ from .query import (
     total,
     count_by_property,
     properties,
-    query_async,
-    TimeoutError,
 )
+
+from .workers import query_async, insert_async, TimeoutError
