@@ -25,4 +25,4 @@ from .query import (
     properties,
 )
 
-from .workers import query_async, insert_async, TimeoutError
+from .workers import query_async, insert_async, delete_async, TimeoutError

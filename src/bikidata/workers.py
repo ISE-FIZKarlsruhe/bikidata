@@ -1,8 +1,8 @@
 import os, time, json, random, hashlib, traceback
 import xxhash
 import duckdb
-from .query import query, spo, handle_insert
-from .main import DB_PATH, log
+from .query import query, handle_insert, handle_delete
+from .main import log
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 log.debug("Trying Redis at " + REDIS_HOST)
@@ -25,12 +25,16 @@ async def redis_manager():
         query_ticket = None
         try:
             opts = json.loads(serial_query)
-            log.debug(f"opts keys {opts.keys()}")
-            if opts.get("action") == "insert":
+            opts["msg_received_time"] = time.time()
+            if opts.get("action") in ("insert", "delete"):
+                if opts.get("action") == "insert":
+                    result = handle_insert(opts)
+                if opts.get("action") == "delete":
+                    result = handle_delete(opts)
                 query_ticket = opts.get("query_ticket")
-                log.debug(f"Processing insert action fotr ticket {query_ticket}")
-                result = handle_insert(opts)
                 if query_ticket:
+                    result["msg_received_time"] = opts["msg_received_time"]
+                    result["msg_processed_time"] = time.time()
                     await redis_client.lpush(query_ticket, json.dumps(result))
                 continue
             else:
@@ -43,6 +47,7 @@ async def redis_manager():
                         {
                             "error": "Failed to process query",
                             "trace": traceback.format_exc(),
+                            "msg_received_time": opts.get("msg_received_time"),
                         }
                     ),
                 )
@@ -55,10 +60,14 @@ async def redis_worker():
     while True:
         _, serial_query = await redis_client.blpop(WORKER_FETCH_Q_READY)
         opts = json.loads(serial_query)
+        opts["msg_worker_received_time"] = time.time()
         query_hash = opts.get("query_hash")
         query_ticket = opts.get("query_ticket")
         if not query_ticket:
             log.error("No query ticket found in query")
+            continue
+        if not query_hash:
+            log.error("No query hash found in query")
             continue
         cached = await redis_client.get(query_hash or "")
         if cached:
@@ -67,6 +76,7 @@ async def redis_worker():
         else:
             log.debug(f"Processing query ticket {query_ticket}")
             result = query(opts)
+            result["msg_processed_time"] = time.time()
             await redis_client.set(query_hash, json.dumps(result), ex=60 * 60 * 24 * 7)
         await redis_client.lpush(query_ticket, json.dumps(result))
 
@@ -92,9 +102,21 @@ async def query_async(opts: dict, timeout: int = 60):
 
 
 async def insert_async(s: str, p: str, o: str, g: str = "", timeout: int = 60):
+    return await insert_delete_async("insert", s, p, o, g, timeout)
+
+
+async def delete_async(
+    s: str, p: str | None, o: str | None, g: str = "", timeout: int = 60
+):
+    return await insert_delete_async("delete", s, p, o, g, timeout)
+
+
+async def insert_delete_async(
+    action: str, s: str, p: str, o: str, g: str = "", timeout: int = 60
+):
     query_ticket = f"{time.time()}-{random.randint(0,1000000)}"
     opts = {
-        "action": "insert",
+        "action": action,
         "data": [{"s": s, "p": p, "o": o, "g": g}],
         "query_ticket": query_ticket,
     }

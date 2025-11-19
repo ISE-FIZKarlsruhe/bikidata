@@ -465,6 +465,40 @@ LEFT JOIN pref P ON P.s = S.s
         raise ValueError(f"Unsupported order.by='{by}'")
 
 
+def handle_delete(opts: dict):
+    buf = []
+    for item in opts.get("data", []):
+        s = item.get("s")
+        p = item.get("p")
+        o = item.get("o")
+        g = item.get("g", "")
+        existing = spo(s, p, o, g)
+        if len(existing) == 0:
+            err = "Triple does not exist, skipping delete"
+            log.error(err)
+            return {"error": err}
+
+        ss = xxhash.xxh64_hexdigest(s).lower()
+        pp = xxhash.xxh64_hexdigest(p).lower()
+        oo = xxhash.xxh64_hexdigest(o).lower()
+        gg = xxhash.xxh64_hexdigest(g).lower()
+
+        buf.append((f"0x{ss}", f"0x{pp}", f"0x{oo}", f"0x{gg}"))
+
+    result = {
+        "triples_deleted": len(buf),
+    }
+    DB = duckdb.connect(DB_PATH)
+    if len(buf) > 0:
+        DB.executemany(
+            "DELETE FROM triples WHERE s = ?::ubigint and p = ?::ubigint and o = ?::ubigint and g = ?::ubigint",
+            buf,
+        )
+    DB.commit()
+    DB.close()
+    return result
+
+
 def handle_insert(opts: dict):
     iris_to_add = {}
     literals_to_add = {}
