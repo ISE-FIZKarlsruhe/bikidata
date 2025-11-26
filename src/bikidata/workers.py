@@ -73,6 +73,9 @@ async def redis_worker():
         if use_cache:
             cached = await redis_client.get(query_hash or "")
         else:
+            log.debug(
+                f"Not using cache use_cache={use_cache} for query ticket {query_ticket}"
+            )
             cached = None
         if cached:
             log.debug(f"Cache hit for query ticket {query_ticket}")
@@ -113,19 +116,31 @@ async def insert_async(s: str, p: str, o: str, g: str = "", timeout: int = 60):
 
 
 async def delete_async(
-    s: str, p: str | None, o: str | None, g: str = "", timeout: int = 60
+    s: str,
+    p: str | None,
+    o: str | None,
+    g: str = "",
+    timeout: int = 60,
+    are_hashes=False,
 ):
-    return await insert_delete_async("delete", s, p, o, g, timeout)
+    return await insert_delete_async("delete", s, p, o, g, timeout, are_hashes)
 
 
 async def insert_delete_async(
-    action: str, s: str, p: str, o: str, g: str = "", timeout: int = 60
+    action: str,
+    s: str,
+    p: str,
+    o: str,
+    g: str = "",
+    timeout: int = 60,
+    are_hashes=False,
 ):
     query_ticket = f"{time.time()}-{random.randint(0,1000000)}"
     opts = {
         "action": action,
         "data": [{"s": s, "p": p, "o": o, "g": g}],
         "query_ticket": query_ticket,
+        "are_hashes": are_hashes,
     }
     serial_query = json.dumps(opts)
     await redis_client.lpush(WORKER_FETCH_Q, serial_query)

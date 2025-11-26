@@ -472,16 +472,23 @@ def handle_delete(opts: dict):
         p = item.get("p")
         o = item.get("o")
         g = item.get("g", "")
-        existing = spo(s, p, o, g)
-        if len(existing) == 0:
-            err = "Triple does not exist, skipping delete"
-            log.error(err)
-            return {"error": err}
+        are_hashes = opts.get("are_hashes", False)
+        if not are_hashes:
+            existing = spo(s, p, o, g)
+            if len(existing) == 0:
+                err = "Triple does not exist, skipping delete"
+                log.error(err)
+                return {"error": err}
 
-        ss = xxhash.xxh64_hexdigest(s).lower()
-        pp = xxhash.xxh64_hexdigest(p).lower()
-        oo = xxhash.xxh64_hexdigest(o).lower()
-        gg = xxhash.xxh64_hexdigest(g).lower()
+            ss = xxhash.xxh64_hexdigest(s).lower()
+            pp = xxhash.xxh64_hexdigest(p).lower()
+            oo = xxhash.xxh64_hexdigest(o).lower()
+            gg = xxhash.xxh64_hexdigest(g).lower()
+        else:
+            ss = s
+            pp = p
+            oo = o
+            gg = g
 
         buf.append((f"0x{ss}", f"0x{pp}", f"0x{oo}", f"0x{gg}"))
 
