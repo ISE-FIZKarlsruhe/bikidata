@@ -497,11 +497,15 @@ def handle_delete(opts: dict):
     }
     DB = duckdb.connect(DB_PATH)
     if len(buf) > 0:
-        DB.executemany(
-            "DELETE FROM triples WHERE s = ?::ubigint and p = ?::ubigint and o = ?::ubigint and g = ?::ubigint",
-            buf,
-        )
-    DB.commit()
+        try:
+            DB.executemany(
+                "DELETE FROM triples WHERE s = ?::ubigint and p = ?::ubigint and o = ?::ubigint and g = ?::ubigint",
+                buf,
+            )
+            DB.commit()
+        except Exception as e:
+            log.error(f"Error during delete: {e}")
+            result["error"] = str(e)
     DB.close()
     return result
 
@@ -574,20 +578,25 @@ def handle_insert(opts: dict):
     to_add = [
         (f"0x{h}", iri) for iri, h in literals_to_add.items() if iri not in existing
     ]
-    if len(to_add) > 0:
-        DB.executemany(
-            "INSERT INTO literals (hash, value) VALUES (?::ubigint, ?)", to_add
-        )
-        result["literals_inserted"] = len(to_add)
 
-    if len(buf) > 0:
-        DB.executemany(
-            "INSERT INTO triples (s, p, o, g) VALUES (?::ubigint, ?::ubigint, ?::ubigint, ?::ubigint)",
-            buf,
-        )
-        result["triples_inserted"] = len(buf)
+    try:
+        if len(to_add) > 0:
+            DB.executemany(
+                "INSERT INTO literals (hash, value) VALUES (?::ubigint, ?)", to_add
+            )
+            result["literals_inserted"] = len(to_add)
 
-    DB.commit()
+        if len(buf) > 0:
+            DB.executemany(
+                "INSERT INTO triples (s, p, o, g) VALUES (?::ubigint, ?::ubigint, ?::ubigint, ?::ubigint)",
+                buf,
+            )
+            result["triples_inserted"] = len(buf)
+        DB.commit()
+    except Exception as e:
+        log.error(f"Error during insert: {e}")
+        result["error"] = str(e)
+
     DB.close()
     return result
 
