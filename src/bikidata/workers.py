@@ -69,7 +69,11 @@ async def redis_worker():
         if not query_hash:
             log.error("No query hash found in query")
             continue
-        cached = await redis_client.get(query_hash or "")
+        use_cache = opts.get("use_cache", True)
+        if use_cache:
+            cached = await redis_client.get(query_hash or "")
+        else:
+            cached = None
         if cached:
             log.debug(f"Cache hit for query ticket {query_ticket}")
             result = json.loads(cached)
@@ -77,7 +81,10 @@ async def redis_worker():
             log.debug(f"Processing query ticket {query_ticket}")
             result = query(opts)
             result["msg_processed_time"] = time.time()
-            await redis_client.set(query_hash, json.dumps(result), ex=60 * 60 * 24 * 7)
+            if use_cache:
+                await redis_client.set(
+                    query_hash, json.dumps(result), ex=60 * 60 * 24 * 7
+                )
         await redis_client.lpush(query_ticket, json.dumps(result))
 
 
