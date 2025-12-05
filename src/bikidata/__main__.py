@@ -12,6 +12,7 @@ def check_suffix(filename):
 
 
 if sys.argv[1] == "worker":
+    num_workers = 1
     if len(sys.argv) > 2:
         try:
             num_workers = int(sys.argv[2])
