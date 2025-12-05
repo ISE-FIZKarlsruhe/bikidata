@@ -3,6 +3,8 @@ import xxhash
 import duckdb
 from .query import query, handle_insert, handle_delete
 from .main import log
+from multiprocessing import Process
+import asyncio
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 log.debug("Trying Redis at " + REDIS_HOST)
@@ -18,16 +20,19 @@ WORKER_FETCH_Q = "bikidata:queries"
 WORKER_FETCH_Q_READY = "bikidata:queries_ready"
 
 
-async def worker_main(num_workers: int = 1):
+def worker_process_entry():
+    asyncio.run(redis_worker())
+
+
+def worker_main(num_workers: int = 1):
     log.debug("Entering worker main")
+    processes = []
     for _ in range(num_workers):
-        pid = os.fork()
-        if pid != 0:
-            log.debug(f"Starting worker process {pid}")
-            await redis_worker()
-            log.debug(f"{pid} Worker done")
-            sys.exit(0)
-    await redis_manager()
+        p = Process(target=worker_process_entry)
+        p.start()
+        processes.append(p)
+        log.debug(f"Starting worker process {p.pid}")
+    asyncio.run(redis_manager())
 
 
 async def redis_manager():

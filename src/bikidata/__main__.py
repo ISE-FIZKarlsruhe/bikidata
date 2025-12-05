@@ -1,7 +1,6 @@
 import os, sys
 from .main import build
 from .workers import worker_main
-import asyncio
 
 
 def check_suffix(filename):
@@ -18,7 +17,7 @@ if sys.argv[1] == "worker":
             num_workers = int(sys.argv[2])
         except:
             num_workers = 1
-    asyncio.run(worker_main(num_workers))
+    worker_main(num_workers)
     sys.exit(0)
 
 if check_suffix(sys.argv[1]):
