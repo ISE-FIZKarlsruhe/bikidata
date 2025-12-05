@@ -1,4 +1,4 @@
-import os, time, json, random, hashlib, traceback
+import os, time, json, random, hashlib, traceback, sys
 import xxhash
 import duckdb
 from .query import query, handle_insert, handle_delete
@@ -16,6 +16,18 @@ except:
 
 WORKER_FETCH_Q = "bikidata:queries"
 WORKER_FETCH_Q_READY = "bikidata:queries_ready"
+
+
+async def worker_main(num_workers: int = 1):
+    log.debug("Entering worker main")
+    for _ in range(num_workers):
+        pid = os.fork()
+        if pid != 0:
+            log.debug(f"Starting worker process {pid}")
+            await redis_worker()
+            log.debug(f"{pid} Worker done")
+            sys.exit(0)
+    await redis_manager()
 
 
 async def redis_manager():
