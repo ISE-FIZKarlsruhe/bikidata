@@ -4,16 +4,6 @@ import xxhash
 from .main import DB_PATH, log
 import duckdb
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
-log.debug("Trying Redis at " + REDIS_HOST)
-
-try:
-    import redis.asyncio as redis
-
-    redis_client = redis.Redis(host=REDIS_HOST)
-except:
-    log.exception(f"Redis at {REDIS_HOST} not available, async queries will not work")
-
 
 def raw():
     DB = duckdb.connect(DB_PATH, read_only=True)
@@ -475,45 +465,156 @@ LEFT JOIN pref P ON P.s = S.s
         raise ValueError(f"Unsupported order.by='{by}'")
 
 
-async def redis_worker():
-    log.debug("Entering worker loop, using Redis")
-    while True:
-        _, serial_query = await redis_client.blpop("bikidata:queries")
-        opts = json.loads(serial_query)
-        query_hash = opts.get("query_hash")
-        query_ticket = opts.get("query_ticket")
-        if not query_ticket:
-            log.error("No query ticket found in query")
-            continue
-        cached = await redis_client.get(query_hash)
-        if cached:
-            log.debug(f"Cache hit for query ticket {query_ticket}")
-            result = json.loads(cached)
+def handle_delete(opts: dict):
+    buf = []
+    buf_no_o = []
+    for item in opts.get("data", []):
+        s = item.get("s")
+        p = item.get("p")
+        o = item.get("o")
+        g = item.get("g", "")
+        are_hashes = opts.get("are_hashes", False)
+        if not are_hashes:
+            existing = spo(s, p, o, g)
+            if len(existing) == 0:
+                err = "Triple does not exist, skipping delete"
+                log.error(err)
+                return {"error": err}
+
+            ss = xxhash.xxh64_hexdigest(s).lower()
+            pp = xxhash.xxh64_hexdigest(p).lower()
+            oo = xxhash.xxh64_hexdigest(o).lower() if o else None
+            gg = xxhash.xxh64_hexdigest(g).lower()
         else:
-            log.debug(f"Processing query ticket {query_ticket}")
-            result = query(opts)
-            await redis_client.set(query_hash, json.dumps(result), ex=60 * 60 * 24 * 7)
-        await redis_client.lpush(query_ticket, json.dumps(result))
+            ss = s
+            pp = p
+            oo = o
+            gg = g
+
+        if oo is None:
+            buf_no_o.append((f"0x{ss}", f"0x{pp}", f"0x{gg}"))
+        else:
+            buf.append((f"0x{ss}", f"0x{pp}", f"0x{oo}", f"0x{gg}"))
+
+    result = {
+        "triples_deleted": len(buf) + len(buf_no_o),
+    }
+    DB = duckdb.connect(DB_PATH)
+    if len(buf) > 0:
+        try:
+            DB.executemany(
+                "DELETE FROM triples WHERE s = ?::ubigint and p = ?::ubigint and o = ?::ubigint and g = ?::ubigint",
+                buf,
+            )
+            DB.commit()
+        except Exception as e:
+            log.error(f"Error during delete: {e}")
+            result["error"] = str(e)
+
+    if len(buf_no_o) > 0:
+        try:
+            DB.executemany(
+                "DELETE FROM triples WHERE s = ?::ubigint and p = ?::ubigint and g = ?::ubigint",
+                buf_no_o,
+            )
+            DB.commit()
+        except Exception as e:
+            log.error(f"Error during delete: {e}")
+            result["error"] = str(e)
+
+    DB.close()
+    return result
 
 
-class TimeoutError(Exception):
-    pass
+def handle_insert(opts: dict):
+    iris_to_add = {}
+    literals_to_add = {}
+    buf = []
+    for item in opts.get("data", []):
+        s = item.get("s")
+        p = item.get("p")
+        o = item.get("o")
+        g = item.get("g", "")
+        err = None
+        if not s or not p or not o:
+            err = "Insert triple missing s, p, or o"
+        if not (s.startswith("<") or s.startswith("_:")):
+            err = "Subject must be an IRI or BlankNode"
+        if not (p.startswith("<") and p.endswith(">")):
+            err = "Predicate must be an IRI"
+        if not (o.startswith('"') or o.startswith("<") or o.startswith("_:")):
+            err = "Object must be a literal, IRI or a BlankNode"
+        existing = spo(s, p, o, g)
+        if len(existing) > 0:
+            err = "Triple already exists, skipping insert"
 
+        if err:
+            log.error(err)
+            return {"error": err}
 
-async def query_async(opts: dict):
-    query_ticket = f"{time.time()}-{random.randint(0,1000000)}"
-    query_hash = hashlib.md5(
-        json.dumps(opts, sort_keys=True).encode("utf8")
-    ).hexdigest()
-    opts["query_ticket"] = query_ticket
-    opts["query_hash"] = query_hash
-    serial_query = json.dumps(opts)
-    await redis_client.lpush("bikidata:queries", serial_query)
-    popresult = await redis_client.blpop(query_ticket, timeout=60)
-    if popresult is None:
-        raise TimeoutError("Query timed out")
-    _, result = popresult
-    return json.loads(result)
+        ss = xxhash.xxh64_hexdigest(s).lower()
+        pp = xxhash.xxh64_hexdigest(p).lower()
+        oo = xxhash.xxh64_hexdigest(o).lower()
+        gg = xxhash.xxh64_hexdigest(g).lower()
+
+        iris_to_add[s] = ss
+        iris_to_add[p] = pp
+        if o.startswith("<") and o.endswith(">"):
+            iris_to_add[o] = oo
+        else:
+            literals_to_add[o] = oo
+        if g != "":
+            iris_to_add[g] = gg
+        buf.append((f"0x{ss}", f"0x{pp}", f"0x{oo}", f"0x{gg}"))
+
+    DB = duckdb.connect(DB_PATH)
+
+    result = {}
+    iri_checks = [("?::ubigint", f"0x{iri}") for iri in iris_to_add.values()]
+    existing = [
+        row[0]
+        for row in DB.execute(
+            f"SELECT value FROM iris WHERE hash IN ({', '.join([p for p, _ in iri_checks])})",
+            [i for _, i in iri_checks],
+        ).fetchall()
+    ]
+    to_add = [(f"0x{h}", iri) for iri, h in iris_to_add.items() if iri not in existing]
+    if len(to_add) > 0:
+        DB.executemany("INSERT INTO iris (hash, value) VALUES (?::ubigint, ?)", to_add)
+        result["iris_inserted"] = len(to_add)
+
+    literal_checks = [("?::ubigint", f"0x{lit}") for lit in literals_to_add.values()]
+    existing = [
+        row[0]
+        for row in DB.execute(
+            f"SELECT value FROM literals WHERE hash IN ({', '.join([p for p, _ in literal_checks])})",
+            [i for _, i in literal_checks],
+        ).fetchall()
+    ]
+    to_add = [
+        (f"0x{h}", iri) for iri, h in literals_to_add.items() if iri not in existing
+    ]
+
+    try:
+        if len(to_add) > 0:
+            DB.executemany(
+                "INSERT INTO literals (hash, value) VALUES (?::ubigint, ?)", to_add
+            )
+            result["literals_inserted"] = len(to_add)
+
+        if len(buf) > 0:
+            DB.executemany(
+                "INSERT INTO triples (s, p, o, g) VALUES (?::ubigint, ?::ubigint, ?::ubigint, ?::ubigint)",
+                buf,
+            )
+            result["triples_inserted"] = len(buf)
+        DB.commit()
+    except Exception as e:
+        log.error(f"Error during insert: {e}")
+        result["error"] = str(e)
+
+    DB.close()
+    return result
 
 
 def query(opts):
@@ -532,6 +633,7 @@ def query(opts):
     fts_for_sorting = []
 
     exclude_properties = opts.get("exclude_properties", [])
+    only_properties = opts.get("only_properties", [])
 
     # --- ADDED: sort-api (order parse & normalize) ---
     order_rules = _normalize_order_rules(opts.get("order", []))
@@ -652,7 +754,17 @@ def query(opts):
 
         # fetch triples for the current page in deterministic order (by wanted.pos)
         if db_cursor.execute("select count(*) from wanted").fetchone()[0] > 0:
-            if len(exclude_properties) > 0:
+            if len(only_properties) > 0:
+                only_properties_list = ",".join([f"'{op}'" for op in only_properties])
+                s_ids_q = f"""
+                    with only_props as (select hash from iris where value in ({only_properties_list}))
+                    select distinct T.s, T.p, T.o, T.g
+                    from wanted W
+                    join triples T on T.s = W.s
+                    where T.p in (select hash from only_props)
+                    order by W.pos
+                """
+            elif len(exclude_properties) > 0:
                 exclude_properties_list = ",".join(
                     [f"'{ep}'" for ep in exclude_properties]
                 )
