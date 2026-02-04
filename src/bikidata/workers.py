@@ -39,16 +39,16 @@ async def redis_manager():
     log.debug(f"Starting Redis worker manager")
     while True:
         _, serial_query = await redis_client.blpop(WORKER_FETCH_Q)
-        query_ticket = None
         try:
             opts = json.loads(serial_query)
+            query_ticket = opts.get("query_ticket")
             opts["msg_received_time"] = time.time()
             if opts.get("action") in ("insert", "delete"):
                 if opts.get("action") == "insert":
                     result = handle_insert(opts)
                 if opts.get("action") == "delete":
                     result = handle_delete(opts)
-                query_ticket = opts.get("query_ticket")
+
                 if query_ticket:
                     result["msg_received_time"] = opts["msg_received_time"]
                     result["msg_processed_time"] = time.time()
