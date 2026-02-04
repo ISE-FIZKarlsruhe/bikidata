@@ -467,6 +467,7 @@ LEFT JOIN pref P ON P.s = S.s
 
 def handle_delete(opts: dict):
     buf = []
+    buf_no_o = []
     for item in opts.get("data", []):
         s = item.get("s")
         p = item.get("p")
@@ -482,7 +483,7 @@ def handle_delete(opts: dict):
 
             ss = xxhash.xxh64_hexdigest(s).lower()
             pp = xxhash.xxh64_hexdigest(p).lower()
-            oo = xxhash.xxh64_hexdigest(o).lower()
+            oo = xxhash.xxh64_hexdigest(o).lower() if o else None
             gg = xxhash.xxh64_hexdigest(g).lower()
         else:
             ss = s
@@ -490,10 +491,13 @@ def handle_delete(opts: dict):
             oo = o
             gg = g
 
-        buf.append((f"0x{ss}", f"0x{pp}", f"0x{oo}", f"0x{gg}"))
+        if oo is None:
+            buf_no_o.append((f"0x{ss}", f"0x{pp}", f"0x{gg}"))
+        else:
+            buf.append((f"0x{ss}", f"0x{pp}", f"0x{oo}", f"0x{gg}"))
 
     result = {
-        "triples_deleted": len(buf),
+        "triples_deleted": len(buf) + len(buf_no_o),
     }
     DB = duckdb.connect(DB_PATH)
     if len(buf) > 0:
@@ -506,6 +510,18 @@ def handle_delete(opts: dict):
         except Exception as e:
             log.error(f"Error during delete: {e}")
             result["error"] = str(e)
+
+    if len(buf_no_o) > 0:
+        try:
+            DB.executemany(
+                "DELETE FROM triples WHERE s = ?::ubigint and p = ?::ubigint and g = ?::ubigint",
+                buf_no_o,
+            )
+            DB.commit()
+        except Exception as e:
+            log.error(f"Error during delete: {e}")
+            result["error"] = str(e)
+
     DB.close()
     return result
 
@@ -617,6 +633,7 @@ def query(opts):
     fts_for_sorting = []
 
     exclude_properties = opts.get("exclude_properties", [])
+    only_properties = opts.get("only_properties", [])
 
     # --- ADDED: sort-api (order parse & normalize) ---
     order_rules = _normalize_order_rules(opts.get("order", []))
@@ -737,7 +754,17 @@ def query(opts):
 
         # fetch triples for the current page in deterministic order (by wanted.pos)
         if db_cursor.execute("select count(*) from wanted").fetchone()[0] > 0:
-            if len(exclude_properties) > 0:
+            if len(only_properties) > 0:
+                only_properties_list = ",".join([f"'{op}'" for op in only_properties])
+                s_ids_q = f"""
+                    with only_props as (select hash from iris where value in ({only_properties_list}))
+                    select distinct T.s, T.p, T.o, T.g
+                    from wanted W
+                    join triples T on T.s = W.s
+                    where T.p in (select hash from only_props)
+                    order by W.pos
+                """
+            elif len(exclude_properties) > 0:
                 exclude_properties_list = ",".join(
                     [f"'{ep}'" for ep in exclude_properties]
                 )
