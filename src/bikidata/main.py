@@ -1,6 +1,7 @@
 import sys, logging, gzip, re, os, time
 import duckdb
 import xxhash
+import zipfile
 
 DEBUG = os.environ.get("DEBUG", "1") == "1"
 
@@ -76,6 +77,9 @@ def read_nt(triplefile_paths: list):
         if isinstance(triplefile_path, (str, bytes, os.PathLike)):
             if triplefile_path.endswith(".gz"):
                 thefile = gzip.open(triplefile_path, "rb")
+            elif triplefile_path.endswith(".zip"):
+                zf = zipfile.ZipFile(triplefile_path, "r")
+                thefile = zf.open(zf.namelist()[0], "r")
             else:
                 thefile = open(triplefile_path, "rb")
         elif hasattr(triplefile_path, "read"):
@@ -97,7 +101,11 @@ def read_nt(triplefile_paths: list):
                         continue
                 else:
                     continue
-            line = decode_unicode_escapes(line.decode("utf8"))
+            try:
+                line = decode_unicode_escapes(line.decode("utf8"))
+            except:
+                log.error(f"Error decoding line, skipping: {line}")
+                continue
             line = line.strip()
             line = line[:-2]
             parts = line.split(" ")
