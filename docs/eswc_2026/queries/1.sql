@@ -1,0 +1,1 @@
+select count(s) from triples join iris on s = hash where value like '_%'
