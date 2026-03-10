@@ -1,7 +1,0 @@
-PREFIX dblp: <https://dblp.org/rdf/schema#>
-PREFIX dblps: <https://dblp.org/rdf/schema-2020-07-01#>
-PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-
-SELECT (SUM(STRLEN(?cat)) AS ?sum) { { SELECT (GROUP_CONCAT(?o; 
-SEPARATOR=" ") AS ?cat) { ?s dblp:signatureDblpName ?o } GROUP BY ?s } }
