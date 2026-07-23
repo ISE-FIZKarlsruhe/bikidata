@@ -9,17 +9,21 @@ import os, time
 NO_WALKS = 100
 MAX_WALK_LENGTH = 15
 
-# How many vertices to hand to the pool per outer-loop iteration, and how
-# many of those go to each worker per task. Keeping BATCH_SIZE a healthy
-# multiple of the worker count (and CHUNKSIZE small enough to give every
-# worker several tasks) keeps all cores fed.
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 9600))
+# How many vertices to hand to the pool per outer-loop iteration. Chunksize
+# is derived at call time from this and the worker count (see
+# TASKS_PER_WORKER below), so this can safely be tuned independently.
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1000))
 CHUNKSIZE = int(os.getenv("CHUNKSIZE", 100))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", mp.cpu_count()))
+# Target number of tasks handed to each worker per batch. >1 so that
+# variance in per-vertex walk cost (some vertices have far more neighbors
+# than others) gets smoothed out across several smaller tasks per worker,
+# rather than one worker getting unlucky with a single big chunk.
+TASKS_PER_WORKER = 4
+
 log.debug(
     f"Using BATCH_SIZE={BATCH_SIZE} and CHUNKSIZE={CHUNKSIZE} with {MAX_WORKERS} workers"
 )
-
 
 # Built once in the parent process BEFORE the pool is created.
 # Forked children inherit these via copy-on-write — no pickling,
@@ -45,14 +49,18 @@ def _init_worker():
 
 
 def t_generate_walks(s):
+    # Plain Python-level indexing into the shared numpy array, rather than
+    # building a fresh numpy array per walk. MAX_WALK_LENGTH is only 15, so
+    # the fixed overhead of numpy array construction/dispatch per walk (run
+    # NO_WALKS times per vertex) outweighs any vectorization benefit at
+    # this size. The array is still what's shared/COW-friendly across
+    # worker processes — only the per-walk translation loop changes here.
+    lookup = _worker_small_big
     walks = set()
     for _ in range(NO_WALKS):
         walk = _worker_graph.random_walk(s, MAX_WALK_LENGTH, return_type="vertices")
-        # Bulk-translate the whole walk via numpy fancy indexing instead of
-        # a per-node Python-level dict/array lookup loop.
-        hashes = _worker_small_big[np.asarray(walk, dtype=np.int64)]
-        walks.add(tuple(hashes.tolist()))
-    return int(_worker_small_big[s]), [list(w) for w in walks]
+        walks.add(tuple(int(lookup[node]) for node in walk))
+    return int(lookup[s]), [list(w) for w in walks]
 
 
 def make_random_walks(n_batches=None):
@@ -134,8 +142,16 @@ def make_random_walks(n_batches=None):
             if not vertices_to_process:
                 break
 
+            # Chunksize is derived from the ACTUAL batch size, not a fixed
+            # constant — otherwise a smaller BATCH_SIZE (e.g. during testing)
+            # silently starves most workers of work. Aim for roughly
+            # TASKS_PER_WORKER tasks per worker, minimum 1.
+            chunksize = max(
+                1, len(vertices_to_process) // (MAX_WORKERS * TASKS_PER_WORKER)
+            )
+
             results = list(
-                executor.map(t_generate_walks, vertices_to_process, chunksize=CHUNKSIZE)
+                executor.map(t_generate_walks, vertices_to_process, chunksize=chunksize)
             )
 
             cursor.executemany(
@@ -144,7 +160,9 @@ def make_random_walks(n_batches=None):
             )
             cursor.commit()
             end_time = time.time()
-            log.debug(f"Batch {batch} processed in {end_time - start_time:.2f} seconds")
+            log.debug(
+                f"Batch {batch} of {len(todo) // BATCH_SIZE + (1 if len(todo) % BATCH_SIZE else 0)} processed in {end_time - start_time:.2f} seconds"
+            )
 
             batch += 1
             if n_batches is not None and batch >= n_batches:
