@@ -1,169 +1,49 @@
 import duckdb
-import numpy as np
-from .main import DB_PATH, log
-import igraph as ig
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
-import os, time
+from gensim.models import Word2Vec
+import os
+from .main import log
 
-NO_WALKS = 100
-MAX_WALK_LENGTH = 15
-
-# How many vertices to hand to the pool per outer-loop iteration. Chunksize
-# is derived at call time from this and the worker count (see
-# TASKS_PER_WORKER below), so this can safely be tuned independently.
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 1000))
-CHUNKSIZE = int(os.getenv("CHUNKSIZE", 100))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", mp.cpu_count()))
-# Target number of tasks handed to each worker per batch. >1 so that
-# variance in per-vertex walk cost (some vertices have far more neighbors
-# than others) gets smoothed out across several smaller tasks per worker,
-# rather than one worker getting unlucky with a single big chunk.
-TASKS_PER_WORKER = 4
-
-log.debug(
-    f"Using BATCH_SIZE={BATCH_SIZE} and CHUNKSIZE={CHUNKSIZE} with {MAX_WORKERS} workers"
-)
-
-# Built once in the parent process BEFORE the pool is created.
-# Forked children inherit these via copy-on-write — no pickling,
-# no per-worker duplication.
-#
-# IMPORTANT: _worker_small_big is a numpy array, not a dict. Indexing into
-# a numpy array touches one contiguous C buffer and doesn't mutate Python
-# object refcounts, so the OS's copy-on-write pages stay shared across all
-# worker processes. A plain Python dict here would get incrementally
-# copied (page by page) into every worker process as soon as it's read
-# from, because every dict lookup touches per-object refcount fields —
-# silently duplicating an 18M+ entry structure up to N-worker times over
-# and blowing up memory / cache locality.
-_worker_graph = None
-_worker_small_big = None
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", default=6))
+EPOCHS = int(os.getenv("EPOCHS", default=10))
+WALK_LIMIT = int(os.getenv("WALK_LIMIT", default=-1))
 
 
-def _init_worker():
-    # With fork, _worker_graph/_worker_small_big are already populated
-    # by inheritance from the parent — nothing to do here except confirm.
-    global _worker_graph, _worker_small_big
-    assert _worker_graph is not None, "graph must be built before pool creation"
+class WalkYielder:
+    def __init__(self, db_path: str = "bikidata.duckdb", limit: int = -1):
+        self.db_path = db_path
+        self.limit = limit
+
+    def __iter__(self):
+        con = duckdb.connect(self.db_path, read_only=True)
+        must_continue = True
+        result = con.execute(
+            f"SELECT UNNEST(walks) AS walk FROM random_walks{' LIMIT ' + str(self.limit) if self.limit > 0 else ''}"
+        )
+        while must_continue:
+            row = result.fetchone()
+            if row is None:
+                break
+            yield list(filter(None, [int(x) for x in row[0]]))
 
 
-def t_generate_walks(s):
-    # Plain Python-level indexing into the shared numpy array, rather than
-    # building a fresh numpy array per walk. MAX_WALK_LENGTH is only 15, so
-    # the fixed overhead of numpy array construction/dispatch per walk (run
-    # NO_WALKS times per vertex) outweighs any vectorization benefit at
-    # this size. The array is still what's shared/COW-friendly across
-    # worker processes — only the per-walk translation loop changes here.
-    lookup = _worker_small_big
-    walks = set()
-    for _ in range(NO_WALKS):
-        walk = _worker_graph.random_walk(s, MAX_WALK_LENGTH, return_type="vertices")
-        walks.add(tuple(int(lookup[node]) for node in walk))
-    return int(lookup[s]), [list(w) for w in walks]
-
-
-def make_random_walks(n_batches=None):
-    global _worker_graph, _worker_small_big
-
-    DB = duckdb.connect(DB_PATH)
-    cursor = DB.cursor()
-    cursor.execute(
-        "create table if not exists random_walks (s ubigint, walks ubigint[][])"
+def make_rdf2vec_model(model_path: str = "bikidata_word2vec.model"):
+    model = Word2Vec(
+        sentences=WalkYielder(limit=WALK_LIMIT),
+        vector_size=100,  # embedding dimensionality
+        window=5,  # context window size
+        min_count=1,  # keep all ids, even rare ones
+        sg=1,  # skip-gram (use sg=0 for CBOW)
+        workers=WORKER_COUNT,
+        epochs=EPOCHS,
     )
+    model.save(model_path)
 
-    small_big = {}
-    big_small = {}
-    i = 0
-    for row in DB.execute(
-        "select hash from iris union select hash from literals order by hash"
-    ).fetchall():
-        h = row[0]
-        big_small[h] = i
-        small_big[i] = h
-        i += 1
-    log.debug(f"Retrieved {len(small_big)} hashes")
+    return model
 
-    edges = []
-    for s, o in DB.execute("select distinct s,o from triples").fetchall():
-        edges.append((big_small[s], big_small[o]))
-    log.debug(f"Retrieved {len(edges)} edges")
 
-    n_vertices = len(small_big)
-
-    # Build these as globals BEFORE forking workers, so children inherit
-    # them via copy-on-write instead of via pickled initargs.
-    graph = ig.Graph(n=n_vertices)
-    graph.add_edges(edges)
-    _worker_graph = graph
-
-    # numpy array instead of dict: see comment on _worker_small_big above.
-    small_big_arr = np.zeros(n_vertices, dtype=np.uint64)
-    for idx, h in small_big.items():
-        small_big_arr[idx] = h
-    _worker_small_big = small_big_arr
-
-    # Free the parent's non-shared copies we no longer need directly
-    # (graph/small_big are now referenced via the globals above).
-    del edges
-    del small_big
-
-    # --- Compute the full "still to do" work queue ONCE up front. ---
-    # The old approach re-ran a LEFT JOIN of the entire (growing) triples
-    # table against the entire (growing) random_walks table on every single
-    # batch, to find just 1000 rows. As random_walks filled up this got
-    # progressively more expensive — pure bookkeeping overhead on top of
-    # the actual walk computation, and it scales with total progress made
-    # so far rather than staying constant per batch.
-    already_done = {
-        row[0] for row in DB.execute("select s from random_walks").fetchall()
-    }
-    log.debug(f"{len(already_done)} vertices already have walks computed")
-
-    all_s = [row[0] for row in DB.execute("select distinct s from triples").fetchall()]
-    log.debug(f"Retrieved {len(all_s)} distinct source vertices")
-
-    todo = [big_small[s] for s in all_s if s not in already_done]
-    del all_s
-    del already_done
-    log.debug(f"{len(todo)} vertices remaining to process")
-
-    ctx = mp.get_context("fork")  # be explicit; don't rely on platform default
-
-    with ProcessPoolExecutor(
-        max_workers=MAX_WORKERS,
-        mp_context=ctx,
-        initializer=_init_worker,
-    ) as executor:
-        batch = 0
-        for batch_start in range(0, len(todo), BATCH_SIZE):
-            start_time = time.time()
-            vertices_to_process = todo[batch_start : batch_start + BATCH_SIZE]
-            if not vertices_to_process:
-                break
-
-            # Chunksize is derived from the ACTUAL batch size, not a fixed
-            # constant — otherwise a smaller BATCH_SIZE (e.g. during testing)
-            # silently starves most workers of work. Aim for roughly
-            # TASKS_PER_WORKER tasks per worker, minimum 1.
-            chunksize = max(
-                1, len(vertices_to_process) // (MAX_WORKERS * TASKS_PER_WORKER)
-            )
-
-            results = list(
-                executor.map(t_generate_walks, vertices_to_process, chunksize=chunksize)
-            )
-
-            cursor.executemany(
-                "insert into random_walks (s, walks) values (?, CAST(? AS UBIGINT[][]))",
-                results,
-            )
-            cursor.commit()
-            end_time = time.time()
-            log.debug(
-                f"Batch {batch} of {len(todo) // BATCH_SIZE + (1 if len(todo) % BATCH_SIZE else 0)} processed in {end_time - start_time:.2f} seconds"
-            )
-
-            batch += 1
-            if n_batches is not None and batch >= n_batches:
-                break
+def get_rdf2vec_model(model_path: str = "bikidata_word2vec.model"):
+    if os.path.exists(model_path):
+        return Word2Vec.load(model_path)
+    else:
+        log.warning(f"Model not found at {model_path}, creating a new one.")
+        return make_rdf2vec_model(model_path)
