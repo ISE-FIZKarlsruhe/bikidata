@@ -16,8 +16,17 @@ dependencies = [
     "pandas>=2.2.3",
     "cohere==5.15.0",
     "redis>=6.4.0",
+    "rdflib>=7.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
 ]
 
 [project.urls]
 Homepage = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
 Repository = "https://github.com/ISE-FIZKarlsruhe/bikidata/"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

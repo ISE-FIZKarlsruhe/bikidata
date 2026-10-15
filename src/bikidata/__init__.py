@@ -25,4 +25,6 @@ from .query import (
     properties,
 )
 
+from .sparql_engine import sparql, SparqlError
+
 from .workers import query_async, insert_async, delete_async, TimeoutError
