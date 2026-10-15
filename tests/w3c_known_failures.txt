@@ -1,0 +1,23 @@
+# W3C tests that bikidata.sparql does not pass, with the reason.
+# They are run as expected failures (strict), so a test that starts passing
+# shows up as a failure until it is removed from this list.
+
+# SPARQL 1.0 tests that assume RDF 1.0 literal semantics: "x"^^xsd:string
+# distinct from "x", and comparisons of literals differing in language tag case.
+# Under RDF 1.1 (which bikidata follows) these are the same terms.
+sparql10/open-world/open-eq-08 Assumes RDF 1.0 literal semantics
+sparql10/open-world/open-eq-10 Assumes RDF 1.0 literal semantics
+sparql10/open-world/open-eq-11 Assumes RDF 1.0 literal semantics
+sparql10/open-world/open-eq-12 Assumes RDF 1.0 literal semantics
+
+# rdflib's SPARQL parser drops the rows of VALUES clauses without variables
+sparql11/bindings/values-no-vars-no-rows rdflib parser drops the rows of VALUES ()
+sparql11/bindings/values-no-vars-two-rows rdflib parser drops the rows of VALUES ()
+
+# rdflib's algebra evaluates SELECT expressions before joining a trailing VALUES
+sparql11/bindings/values-group-by-select-expression rdflib applies trailing VALUES after SELECT expressions
+
+# rdflib's SPARQL parser loses the IRI of an inverse path in a negated property set: !^ex:p
+sparql11/property-path/nps_inverse rdflib parser loses IRIs in !^ex:p
+sparql11/property-path/nps_direct_and_inverse rdflib parser loses IRIs in !^ex:p
+sparql11/property-path/nps_a_inverse rdflib parser loses IRIs in !^ex:p
