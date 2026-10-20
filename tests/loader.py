@@ -14,10 +14,11 @@ create table if not exists triples (s ubigint, p ubigint, o ubigint, g ubigint);
 """
 
 
-def build_db(db_path, quads):
+def build_db(db_path, quads, fts=False):
     """Build a bikidata database at db_path with the bikidata build process.
     quads are (s, p, o, g) tuples of N-Triples encoded terms, g is "" for the
-    default graph."""
+    default graph. The full-text index is only built when fts is True, as it
+    takes a few seconds even for tiny databases."""
     quads = list(quads)
     workdir = os.path.dirname(db_path)
     old = (
@@ -30,7 +31,7 @@ def build_db(db_path, quads):
     os.environ["BIKIDATA_MAP_PATH"] = os.path.join(workdir, "maps.tsv")
     try:
         if quads:
-            bikidata_main.build_from_iterator(iter(quads))
+            bikidata_main.build_from_iterator(iter(quads), fts=fts)
         else:
             import duckdb
 

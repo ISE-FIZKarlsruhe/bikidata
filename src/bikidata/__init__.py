@@ -1,6 +1,5 @@
 from .main import (
     build,
-    build_ftss,
     build_from_iterator,
     decode_unicode_escapes,
     literal_to_parts,
@@ -26,5 +25,7 @@ from .query import (
 )
 
 from .sparql_engine import sparql, SparqlError
+
+from .fts import build_fts, fts_search, FTSIndexMissing
 
 from .workers import query_async, insert_async, delete_async, TimeoutError

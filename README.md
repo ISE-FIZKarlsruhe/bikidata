@@ -56,6 +56,35 @@ r = bikidata.query({
 
 For more examples, see the file: [examples.ipynb](examples.ipynb)
 
+# Full-text search
+
+The `fts` filters are answered by a [Tantivy](https://github.com/quickwit-oss/tantivy-py) index, that is built
+together with the database, in a directory next to it (`bikidata.duckdb.fts`, or set `BIKIDATA_FTS_PATH`).
+The index has one document per entity, with:
+
+- its labels (`rdfs:label`, `skos:prefLabel`, `schema:name`, ...), weighted highest
+- all its other literals
+- the labels of the IRIs it links to, weighted lowest
+- the literals of the blank nodes it references, unrolled up to 3 levels deep. So a painting can be found by the
+  name of its artist, even when the production event in between is a blank node.
+
+All the terms of a query have to match, and the [Tantivy query syntax](https://docs.rs/tantivy/latest/tantivy/query/struct.QueryParser.html)
+can be used, for example `"night watch"` for a phrase or `rembrandt OR vermeer`. The filter `"p": "fts 1"` returns
+the entities that link to the matches, `"p": "fts <iri>"` only searches the literals of property `<iri>`.
+The results are sorted by score.
+
+To (re)build the index of an existing database, for example one that was built with an earlier version of bikidata
+that used the DuckDB FTS extension:
+
+```python
+import bikidata
+bikidata.build_fts(stemmer="porter")  # or "german", "french", ..., or "none"
+
+bikidata.fts_search("rembrandt", size=10)  # [(entity, score), ...]
+```
+
+Note that the index is not updated by `insert_async` and `delete_async`, rebuild it with `build_fts` after changes.
+
 # SPARQL queries
 
 Next to the JSON queries, the data can also be queried with [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/).

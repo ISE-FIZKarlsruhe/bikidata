@@ -2,6 +2,7 @@ import time, json, random, hashlib, os
 from .semantic import get_embedding, VEC_DIM
 import xxhash
 from .main import DB_PATH, log
+from .fts import fts_search, fts_hits_frame
 import duckdb
 
 
@@ -119,7 +120,17 @@ def join_parents_sql(hops: int) -> str:
     )
 
 
-def q_to_sql(query: dict):
+def fts_hits_table(o: str, prop: str | None, fts_hits: dict) -> str:
+    """Run the full-text search o, and return the name of the (s, score) table
+    that query() registers with the hits. The same search is only run once."""
+    key = (o, prop)
+    if key not in fts_hits:
+        name = f"fts_hits_{len(fts_hits)}"
+        fts_hits[key] = (name, fts_hits_frame(fts_search(o, prop, db_path=DB_PATH)))
+    return fts_hits[key][0]
+
+
+def q_to_sql(query: dict, fts_hits: dict | None = None):
     p = str(query.get("p", "")).strip(" ")
     o = str(query.get("o", "")).strip(" ")
     g = str(query.get("g", "")).strip(" ")
@@ -185,27 +196,25 @@ def q_to_sql(query: dict):
         )"""
         return psql
     elif p.startswith("fts"):
+        # The hits are entities with a score, from the Tantivy index, see fts.py
+        # An optional property restricts the search to the literals of that property
+        if fts_hits is None:
+            raise ValueError("fts filters need a fts_hits registry, use query()")
+        hits = fts_hits_table(o, p_property, fts_hits)
 
         # parents-join chain (parents >= 1 travels up to ancestors)
         joins = join_parents_sql(parents)
 
-        # optional restriction to a specific child literal property
-        prop_filter = ""
-        if p_property:
-            p_property_hash = xxhash.xxh64_hexdigest(p_property).lower()
-            prop_filter = f" and T0.p = '0x{p_property_hash}'::ubigint"
+        g_filter = ""
+        if g != "":
+            g_hashes = ", ".join([f"'0x{ggg}'::ubigint" for ggg in gg])
+            g_filter = f" and T0.s in (select s from triples where g in ({g_hashes}))"
 
         psql = f"""(
-            with scored as (
-                select *,
-                       fts_main_literals.match_bm25(hash, '{o}', conjunctive:=1) AS score
-                from literals
-            )
             select distinct T{parents}.s{extra_fts_fields}
-            from (select * from scored where score is not null) S
-            join triples T0 on S.hash = T0.o
+            from {hits} T0
             {joins}
-            where 1=1{prop_filter}{extra_g}
+            where 1=1{g_filter}
         )"""
         return psql
 
@@ -639,6 +648,9 @@ def query(opts):
     order_rules = _normalize_order_rules(opts.get("order", []))
     # --- END ADDED: sort-api ---
 
+    # (o, prop) -> (table name, DataFrame) of the full-text searches in the filters
+    fts_hits = {}
+
     for query in opts.get("filters", []):
         op = query.get("op", "should")
         if str(query.get("p")).startswith("fts") or str(query.get("p")).startswith(
@@ -647,16 +659,18 @@ def query(opts):
             fts_query = query.copy()
             fts_query["_extra_fts_fields"] = ", score "
             if not fts_for_sorting:
-                fts_for_sorting = [q_to_sql(fts_query)]
+                fts_for_sorting = [q_to_sql(fts_query, fts_hits)]
             else:
                 if op in ("should", "or"):
-                    fts_for_sorting.append(" UNION " + q_to_sql(fts_query))
+                    fts_for_sorting.append(" UNION " + q_to_sql(fts_query, fts_hits))
                 elif op in ("must", "and"):
-                    fts_for_sorting.append(" INTERSECT " + q_to_sql(fts_query))
+                    fts_for_sorting.append(
+                        " INTERSECT " + q_to_sql(fts_query, fts_hits)
+                    )
         if not queries:
-            queries = [q_to_sql(query)]
+            queries = [q_to_sql(query, fts_hits)]
         else:
-            theq = q_to_sql(query)
+            theq = q_to_sql(query, fts_hits)
             if not theq:
                 continue
             if op in ("should", "or"):
@@ -670,6 +684,8 @@ def query(opts):
 
     DB = duckdb.connect(DB_PATH, read_only=True)
     db_cursor = DB.cursor()
+    for name, frame in fts_hits.values():
+        db_cursor.register(name, frame)
     total = 0
     tofetch = set()
     results = {}
@@ -721,7 +737,7 @@ def query(opts):
                     f"""
                     create temp table wanted as
                     select QJ.s,
-                           row_number() over () as pos
+                           row_number() over (order by SS.score desc, QJ.s) as pos
                     from s_results QJ
                     left join s_by_score SS on QJ.s = SS.s
                     order by SS.score desc, QJ.s

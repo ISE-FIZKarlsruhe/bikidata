@@ -141,7 +141,7 @@ def build(
         return {"duration": 0, "error": error}
 
 
-def build_from_iterator(iterator, stemmer: str = "porter"):
+def build_from_iterator(iterator, stemmer: str = "porter", fts: bool = True):
 
     start_time = time.time()
 
@@ -211,70 +211,15 @@ def build_from_iterator(iterator, stemmer: str = "porter"):
         rf"""insert into iris select ('0x' || column0).lower()::ubigint, ANY_VALUE(column1) from read_csv('{MAP_PATH}', delim='\t|\t', header=false, max_line_size=5100000, quote='') where substr(column1, 1, 1) != '"'  group by column0 order by column0 """
     )
 
-    # We want to allow users to over-ride the FTS settings via environment variable config
-    BIKIDATA_FTS_SETTINGS = os.environ.get("BIKIDATA_FTS_SETTINGS")
-    if BIKIDATA_FTS_SETTINGS:
-        log.debug(f"Using BIKIDATA_FTS_SETTINGS: {BIKIDATA_FTS_SETTINGS}")
-    else:
-        BIKIDATA_FTS_SETTINGS = (
-            f"ignore = '[^a-zA-Z0-9]+', strip_accents = 1, lower=1, stemmer='{stemmer}'"
-        )
-        log.info(
-            f"No BIKIDATA_FTS_SETTINGS found, using default settings: {BIKIDATA_FTS_SETTINGS}"
-        )
-
-    db_connection.execute(
-        f"pragma create_fts_index('literals', 'hash', 'value', {BIKIDATA_FTS_SETTINGS})"
-    )
     db_connection.commit()
 
     os.unlink(TRIPLE_PATH)
     os.unlink(MAP_PATH)
+
+    if fts:
+        from .fts import build_fts
+
+        build_fts(DB_PATH, stemmer=stemmer, db_connection=DB)
     end_time = time.time()
     return {"duration": int(end_time - start_time), "count": count}
 
-
-def build_ftss(stemmer: str = "porter"):
-    # For effective searches, the literals should be grouped by entity
-    start_time = time.time()
-
-    DB = duckdb.connect(DB_PATH)
-    db_connection = DB.cursor()
-
-    db_connection.execute(
-        """
-CREATE TEMPORARY TABLE temp_fts1 AS
-WITH list_values AS (
-  SELECT
-    s, list_distinct(list(value)) AS value_list
-  FROM
-    triples T
-    JOIN literals L ON T.o = L.hash
-  GROUP BY s
-),
-unnested AS (
-  SELECT s, unnest(value_list) AS val FROM list_values
-)
-SELECT
-  s,
-  string_agg(val, '\n') AS values
-FROM unnested GROUP BY s
-"""
-    )
-    db_connection.execute(
-        "CREATE TEMPORARY TABLE temp_fts2 AS SELECT T.s, string_agg(R.values, '\n') AS values FROM triples T JOIN temp_fts1 R ON T.o = R.s  GROUP BY T.s"
-    )
-    db_connection.execute(
-        """
-CREATE TABLE fts AS select s, string_agg(values, '\t') AS values 
-FROM 
-    (SELECT s, values FROM temp_fts1 UNION SELECT s, values FROM temp_fts2) 
-GROUP BY s
-"""
-    )
-    db_connection.execute(
-        f"pragma create_fts_index('fts', 's', 'values', stemmer='{stemmer}')"
-    )
-    db_connection.commit()
-    end_time = time.time()
-    return {"duration": int(end_time - start_time)}
