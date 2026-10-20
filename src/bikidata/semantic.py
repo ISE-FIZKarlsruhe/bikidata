@@ -1,6 +1,6 @@
 import os, time
 import duckdb
-from .main import DB_PATH, log, build_ftss
+from .main import DB_PATH, log
 import cohere
 
 VEC_DIM = 1024
@@ -38,6 +38,43 @@ def get_buf_embeddings(buf):
     return [(sid, vec) for (sid, _), vec in zip(buf, doc_emb)]
 
 
+def build_entity_texts(db_connection):
+    """Create the table entity_texts(s, values) with the literals of each entity,
+    and of the entities it links to, as the input for the embeddings."""
+    db_connection.execute(
+        """
+CREATE TEMPORARY TABLE temp_texts1 AS
+WITH list_values AS (
+  SELECT
+    s, list_distinct(list(value)) AS value_list
+  FROM
+    triples T
+    JOIN literals L ON T.o = L.hash
+  GROUP BY s
+),
+unnested AS (
+  SELECT s, unnest(value_list) AS val FROM list_values
+)
+SELECT
+  s,
+  string_agg(val, '\n') AS values
+FROM unnested GROUP BY s
+"""
+    )
+    db_connection.execute(
+        "CREATE TEMPORARY TABLE temp_texts2 AS SELECT T.s, string_agg(R.values, '\n') AS values FROM triples T JOIN temp_texts1 R ON T.o = R.s  GROUP BY T.s"
+    )
+    db_connection.execute(
+        """
+CREATE TABLE entity_texts AS select s, string_agg(values, '\t') AS values
+FROM
+    (SELECT s, values FROM temp_texts1 UNION SELECT s, values FROM temp_texts2)
+GROUP BY s
+"""
+    )
+    db_connection.commit()
+
+
 def build_semantic(batch_size: int = 96) -> dict:
     # The max batch size in cohere is 96: https://docs.cohere.com/reference/embed
     start_time = time.time()
@@ -46,11 +83,11 @@ def build_semantic(batch_size: int = 96) -> dict:
     db_connection = DB.cursor()
 
     try:
-        literals = db_connection.execute("SELECT s, values FROM fts").fetchall()
+        literals = db_connection.execute("SELECT s, values FROM entity_texts").fetchall()
     except duckdb.CatalogException:
-        log.error("Error: fts table not found, now running build_ftss() to create it.")
-        build_ftss()
-        literals = db_connection.execute("SELECT s, values FROM fts").fetchall()
+        log.debug("entity_texts table not found, creating it.")
+        build_entity_texts(db_connection)
+        literals = db_connection.execute("SELECT s, values FROM entity_texts").fetchall()
 
     db_connection.execute(
         f"CREATE TABLE IF NOT EXISTS literals_semantic (hash ubigint, vec FLOAT[{VEC_DIM}]);"
