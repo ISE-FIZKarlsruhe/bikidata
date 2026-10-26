@@ -136,6 +136,20 @@ def test_uses_configured_database(db, monkeypatch):
     assert values(r, "n") == ["Bob"]
 
 
+def test_default_graph_uri(tmp_path):
+    "The RDF dataset of a query can be selected with the default_graph_uri argument"
+    named_db = str(tmp_path / "named.duckdb")
+    build_db(named_db, graph_quads(parse_graph(DATA), "<http://example.org/g1>"))
+    r = bikidata.sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", db_path=named_db)
+    assert r["results"]["bindings"] == []
+    r = bikidata.sparql(
+        "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+        db_path=named_db,
+        default_graph_uri="http://example.org/g1",
+    )
+    assert len(r["results"]["bindings"]) > 0
+
+
 def test_syntax_error():
     with pytest.raises(bikidata.SparqlError):
         bikidata.sparql("SELECT ?x WHERE { ?x ", db_path="unused.duckdb")

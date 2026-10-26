@@ -347,9 +347,17 @@ def _get(node, key):
 
 
 class Compiler:
-    def __init__(self, union_default_graph=False, base=None):
+    def __init__(
+        self,
+        union_default_graph=False,
+        base=None,
+        default_graph_uri: str | None = None,
+        named_graph_uris: list[str] | None = None,
+    ):
         self.union_default_graph = union_default_graph
         self.base = base
+        self.default_graph_uri = default_graph_uri
+        self.named_graph_uris = named_graph_uris
         self.ctes = []
         self.cols = {}
         self.consts = {}
@@ -360,6 +368,11 @@ class Compiler:
         # The Project of SELECT * and CONSTRUCT queries: rdflib leaves the
         # variables of a trailing VALUES clause out of it.
         self.star_project = None
+        if default_graph_uri is not None:
+            # The RDF dataset was selected by the client, through the SPARQL protocol
+            self.default_graphs = [H(term_to_nt(URIRef(default_graph_uri)))] if default_graph_uri else []
+        if named_graph_uris:
+            self.named_graphs = {H(term_to_nt(URIRef(g))) for g in named_graph_uris}
 
     # Naming helpers
     def fresh(self, prefix):
@@ -427,7 +440,10 @@ class Compiler:
         algebra = query.algebra
         if query.prologue.base:
             self.base = query.prologue.base
-        self.set_dataset(_get(algebra, "datasetClause"))
+        # An RDF dataset selected by the client (SPARQL protocol) takes precedence
+        # over the default graph of the query itself.
+        if self.default_graph_uri is None and not self.named_graph_uris:
+            self.set_dataset(_get(algebra, "datasetClause"))
         gctx = ("default",)
         if getattr(query, "select_star", False) or algebra.name == "ConstructQuery":
             node = algebra.p
@@ -1549,10 +1565,19 @@ def parse(query: str, base: str | None = None):
 
 
 def to_sql(
-    query: str, union_default_graph: bool = False, base: str | None = None
+    query: str,
+    union_default_graph: bool = False,
+    base: str | None = None,
+    default_graph_uri: str | None = None,
+    named_graph_uris: list[str] | None = None,
 ) -> str:
     "Return the DuckDB SQL a SPARQL query is translated into"
-    compiler = Compiler(union_default_graph, base)
+    compiler = Compiler(
+        union_default_graph,
+        base,
+        default_graph_uri=default_graph_uri,
+        named_graph_uris=named_graph_uris,
+    )
     sql, _ = compiler.compile(parse(query, base))
     return sql
 
@@ -1594,6 +1619,8 @@ def sparql(
     db_path: str | None = None,
     union_default_graph: bool = False,
     base: str | None = None,
+    default_graph_uri: str | None = None,
+    named_graph_uris: list[str] | None = None,
 ):
     """Run a SPARQL 1.1 query over a bikidata database.
 
@@ -1605,10 +1632,17 @@ def sparql(
 
     The default graph consists of the triples that were not loaded into a
     named graph. Pass union_default_graph=True to query the union of all the
-    graphs as the default graph instead.
+    graphs as the default graph instead. The RDF dataset can also be selected
+    with the default_graph_uri and named_graph_uris arguments, they take
+    precedence over the default graph of the query.
     """
     q = parse(query, base)
-    compiler = Compiler(union_default_graph, base)
+    compiler = Compiler(
+        union_default_graph,
+        base,
+        default_graph_uri=default_graph_uri,
+        named_graph_uris=named_graph_uris,
+    )
     sql, vars = compiler.compile(q)
     con = duckdb.connect(db_path or main.DB_PATH, read_only=True)
     try:

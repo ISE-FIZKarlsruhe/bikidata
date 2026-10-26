@@ -10,6 +10,19 @@ def check_suffix(filename):
     return False
 
 
+if len(sys.argv) > 1 and sys.argv[1] in ("serve", "server", "run", "sparql"):
+    import uvicorn
+
+    from .server import app
+
+    uvicorn.run(
+        app,
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8000")),
+    )
+    sys.exit(0)
+
+
 if sys.argv[1] == "worker":
     num_workers = 1
     if len(sys.argv) > 2:
