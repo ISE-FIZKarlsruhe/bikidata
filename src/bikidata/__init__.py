@@ -6,13 +6,6 @@ from .main import (
     log,
 )
 
-try:
-    from .semantic import build_semantic
-except:
-    log.warning(
-        "Failed to import build_semantic. "
-        "Make sure you have the required dependencies installed and COHERE_API_KEY env var defined."
-    )
 
 from .query import (
     spo,
@@ -27,5 +20,6 @@ from .query import (
 from .sparql_engine import sparql, SparqlError
 
 from .fts import build_fts, fts_search, FTSIndexMissing
+from .semantic import build_semantic
 
 from .workers import query_async, insert_async, delete_async, TimeoutError

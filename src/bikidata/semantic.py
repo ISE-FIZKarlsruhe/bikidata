@@ -1,41 +1,54 @@
-import os, time
+import os, time, json, urllib.request
 import duckdb
 from .main import DB_PATH, log
-import cohere
 
-VEC_DIM = 1024
+VEC_DIM = int(os.environ.get("VEC_DIM", "1024"))
 
-COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
-if not COHERE_API_KEY:
-    log.error("COHERE_API_KEY environment variable is not set. ")
-else:
-    co = cohere.ClientV2(COHERE_API_KEY)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+OPENAI_EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_TIMEOUT_SECONDS = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
+
+
+def _embed(texts: list, model: str = OPENAI_EMBEDDING_MODEL) -> list:
+    """Embed a list of texts with an OpenAI-compatible /embeddings endpoint,
+    for example https://api.openai.com/v1/embeddings or any other compatible provider.
+    The host (OPENAI_BASE_URL) and the token (OPENAI_API_KEY) are set from the environment."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY environment variable is not set. "
+            "Set it to the token of the embedding API, and OPENAI_BASE_URL to the host of an "
+            "OpenAI-compatible embeddings endpoint."
+        )
+    url = f"{OPENAI_BASE_URL}/embeddings"
+    payload = json.dumps({"model": model, "input": texts}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=OPENAI_TIMEOUT_SECONDS) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    embeddings = [
+        d["embedding"]
+        for d in sorted(data.get("data", []), key=lambda d: d.get("index", 0))
+    ]
+    return embeddings
 
 
 def get_embedding(text: str) -> list:
-    doc_emb = co.embed(
-        model="embed-v4.0",
-        input_type="search_query",
-        texts=[text],
-        max_tokens=8000,
-        truncate="END",
-        output_dimension=VEC_DIM,
-        embedding_types=["float"],
-    ).embeddings.float
-    return doc_emb[0]
+    "Embed a single text as a search query embedding, using the OpenAI-compatible API."""
+    return _embed([text])[0]
 
 
 def get_buf_embeddings(buf):
-    doc_emb = co.embed(
-        model="embed-v4.0",
-        input_type="search_document",
-        texts=[text for _, text in buf],
-        max_tokens=8000,
-        truncate="END",
-        output_dimension=VEC_DIM,
-        embedding_types=["float"],
-    ).embeddings.float
-    return [(sid, vec) for (sid, _), vec in zip(buf, doc_emb)]
+    "Embed a batch of texts, and return the (sid, vec) pairs."""
+    embeddings = _embed([text for _, text in buf])
+    return [(sid, vec) for (sid, _), vec in zip(buf, embeddings)]
 
 
 def build_entity_texts(db_connection):
@@ -76,7 +89,12 @@ GROUP BY s
 
 
 def build_semantic(batch_size: int = 96) -> dict:
-    # The max batch size in cohere is 96: https://docs.cohere.com/reference/embed
+    # The max batch size depends on the embedding provider, an OpenAI-compatible
+    # endpoint accepts up to 2048 documents per request by default.
+    
+    if not OPENAI_BASE_URL:
+        log.error("Make sure you have the required dependencies installed and the OPENAI_BASE_URL environment variable is set.")
+        return 
     start_time = time.time()
 
     DB = duckdb.connect(DB_PATH)
