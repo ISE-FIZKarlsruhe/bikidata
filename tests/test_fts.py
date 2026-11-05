@@ -146,6 +146,32 @@ def test_query_fts_no_hits(query):
     assert r["results"] == {} and r["total"] == 0
 
 
+def test_query_filters_as_keyword_argument(db, monkeypatch):
+    monkeypatch.setattr(sys.modules["bikidata.query"], "DB_PATH", db)
+    r = bikidata.query(filters=[{"p": "fts", "o": "rembrandt"}])
+    assert ids(r) == [f"<{EX}Rembrandt>", f"<{EX}NightWatch>"]
+
+
+def test_query_size_as_keyword_argument(db, monkeypatch):
+    monkeypatch.setattr(sys.modules["bikidata.query"], "DB_PATH", db)
+    r = bikidata.query(filters=[{"p": "id", "o": "random 3"}], size=1)
+    assert r["size"] == 1
+
+
+def test_query_string_argument_is_a_fulltext_query(db, monkeypatch):
+    monkeypatch.setattr(sys.modules["bikidata.query"], "DB_PATH", db)
+    r = bikidata.query("rembrandt")
+    assert ids(r) == [f"<{EX}Rembrandt>", f"<{EX}NightWatch>"]
+
+
+def test_query_single_filter_as_p_and_o_arguments(db, monkeypatch):
+    monkeypatch.setattr(sys.modules["bikidata.query"], "DB_PATH", db)
+    r = bikidata.query(p="fts", o="rembrandt")
+    assert ids(r) == [f"<{EX}Rembrandt>", f"<{EX}NightWatch>"]
+    r = bikidata.query(p="<http://example.org/contains>", o="<http://example.org/NightWatch>")
+    assert ids(r) == [f"<{EX}Collection>"]
+
+
 def test_missing_index(tmp_path):
     with pytest.raises(bikidata.FTSIndexMissing):
         bikidata.fts_search("x", db_path=str(tmp_path / "nothing.duckdb"))

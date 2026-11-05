@@ -56,6 +56,36 @@ r = bikidata.query({
 
 For more examples, see the file: [examples.ipynb](examples.ipynb)
 
+### Query parameters as keyword arguments
+
+Instead of passing a single dictionary, the `query` method also accepts the query parameters
+as keyword arguments, and all the keys that are normally put in the dictionary can be used as
+such:
+
+```python
+import bikidata
+
+r = bikidata.query(
+    filters=[
+        {"p": "fts", "o": "something"},
+    ],
+    size=10,
+)
+```
+
+The first argument can also be a plain string, which is then run as a full-text search:
+
+```python
+r = bikidata.query("something")  # same as {"filters": [{"p": "fts", "o": "something"}]}
+```
+
+A single filter can also be passed with the `p` and `o` keyword arguments, as if it was put in
+a filter list:
+
+```python
+r = bikidata.query(p="<http://example.com/someProp>", o="<http://example.com/someValue>", size=100)
+```
+
 # Full-text search
 
 The `fts` filters are answered by a [Tantivy](https://github.com/quickwit-oss/tantivy-py) index, that is built
@@ -160,6 +190,28 @@ curl -X POST http://localhost:8000/sparql \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --data-urlencode 'query=PREFIX schema: <http://schema.org/> SELECT ?person ?name WHERE { ?person a schema:Person ; schema:name ?name . } LIMIT 10'
 ```
+
+# Docker
+
+Build the container image (it installs the locked dependencies with [uv](https://docs.astral.sh/uv/) and serves the SPARQL endpoint on `0.0.0.0:8000`):
+
+```shell
+docker build -t bikidata .
+docker run --rm -p 8000:8000 bikidata
+```
+
+Then open http://127.0.0.1:8000/sparql and query it, for example with curl:
+
+```shell
+curl -X POST http://localhost:8000/sparql \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode 'query=SELECT * WHERE { ?s ?p ?o } LIMIT 10'
+```
+
+The image serves the SPARQL endpoint on port 8000 (override with `-e HOST=… -e PORT=…`).
+
+A container image is built and pushed to the [GitHub Container Registry](https://github.com/ISE-FIZKarlsruhe/bikidata/pkgs/container/bikidata)
+by the [Docker workflow](.github/workflows/docker.yml).
 
 # Redis support
 

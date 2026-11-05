@@ -626,7 +626,26 @@ def handle_insert(opts: dict):
     return result
 
 
-def query(opts):
+def query(*args, **kwargs):
+    opts = {}
+    for arg in args:
+        if isinstance(arg, dict):
+            opts.update(arg)
+        elif isinstance(arg, str):
+            # A single string argument is a fulltext query for that string
+            fts_filters = list(opts.get("filters") or [])
+            fts_filters.append({"p": "fts", "o": arg})
+            opts["filters"] = fts_filters
+    opts.update(kwargs)
+
+    # Allow passing a single filter as the p and o keyword arguments,
+    # for example: bikidata.query(p="<urn:someProp>", o="<urn:foo>", size=100)
+    if "filters" not in opts and ("p" in opts or "o" in opts):
+        single_filter = {"p": str(opts.get("p") or ""), "o": str(opts.get("o") or "")}
+        if opts.get("op"):
+            single_filter["op"] = opts["op"]
+        opts["filters"] = [single_filter]
+
     try:
         size = int(opts.get("size", 999))
     except:
@@ -652,7 +671,7 @@ def query(opts):
     fts_hits = {}
 
     for query in opts.get("filters", []):
-        op = query.get("op", "should")
+        op = query.get("op") or opts.get("op") or "should"
         if str(query.get("p")).startswith("fts") or str(query.get("p")).startswith(
             "semantic"
         ):
