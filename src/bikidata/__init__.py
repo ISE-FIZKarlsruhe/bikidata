@@ -19,7 +19,7 @@ from .query import (
 
 from .sparql_engine import sparql, SparqlError
 
-from .fts import build_fts, fts_search, FTSIndexMissing
+from .fts import build_fts, fts_analyze, fts_search, FTSIndexMissing
 from .semantic import build_semantic
 
 from .workers import query_async, insert_async, delete_async, TimeoutError

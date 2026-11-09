@@ -4,12 +4,14 @@ and the "fts" filters of bikidata.query
 """
 
 import sys
+import os
+import json
 
 import pytest
 
 import bikidata
 import bikidata.main as bikidata_main
-from bikidata.fts import humanize_iri, fts_index_path
+from bikidata.fts import humanize_iri, fts_index_path, SETTINGS_FILE
 from loader import build_db, graph_quads, parse_graph
 
 DATA = """
@@ -37,6 +39,12 @@ ex:NightWatch a ex:E22_HumanMadeObject ;
 ex:Collection ex:contains ex:NightWatch .
 
 ex:Unlabelled_Thing ex:note "Müller's café" .
+
+ex:GermanThing a ex:E22_HumanMadeObject ;
+    rdfs:label "R\u00e4uber Stra\u00dfe"@de .
+
+ex:NfdThing a ex:E22_HumanMadeObject ;
+    rdfs:label "Mu\u0308ller"@de .
 """
 
 EX = "http://example.org/"
@@ -175,6 +183,76 @@ def test_query_single_filter_as_p_and_o_arguments(db, monkeypatch):
 def test_missing_index(tmp_path):
     with pytest.raises(bikidata.FTSIndexMissing):
         bikidata.fts_search("x", db_path=str(tmp_path / "nothing.duckdb"))
+
+
+def historical_normalizer(text: str) -> str:
+    "A project-specific normalizer hook, here: a historical spelling"
+    return text.replace("Müller", "Muller")
+
+
+def test_nfd_names_are_normalized_before_indexing_and_querying(db):
+    # A decomposed name (NFD) with a diacritic is normalized to NFC before it is
+    # indexed, and before a query is parsed, so that it is reachable through the composed form
+    assert f"<{EX}NfdThing>" in dict(bikidata.fts_search("müller", db_path=db))
+    assert f"<{EX}NfdThing>" in dict(bikidata.fts_search("mu\u0308ller", db_path=db))
+    assert f"<{EX}GermanThing>" in dict(bikidata.fts_search("räuber straße", db_path=db))
+    assert f"<{EX}GermanThing>" in dict(bikidata.fts_search("R\u00e4uber Stra\u00dfe", db_path=db))
+
+
+def test_german_folding(db):
+    # With the German folding, ä→ae, ö→oe, ü→ue, and ß→ss, the German label "Räuber"
+    # and its folded form are tokenized into the same term, here: "raeuber"
+    bikidata.build_fts(db, fold="german")
+    assert (
+        bikidata.fts_analyze("R\u00e4uber Stra\u00dfe", fold="german", stemmer=None)
+        == ["raeuber", "strasse"]
+    )
+    assert f"<{EX}GermanThing>" in dict(bikidata.fts_search("raeuber", db_path=db))
+
+
+def test_german_stemmer_merges_inflections():
+    # The German stemmer merges inflections, here: lied/lieder and werk/werken
+    assert bikidata.fts_analyze("Lied Lieder", stemmer="german") == ["lied", "lied"]
+    assert bikidata.fts_analyze("werk Werken", stemmer="german") == ["werk", "werk"]
+    # The default English porter stemmer does not merge these
+    porter_tokens = bikidata.fts_analyze("Lied Lieder", stemmer="porter")
+    assert porter_tokens[0] != porter_tokens[1]
+
+
+def test_fts_analyze_returns_the_index_tokens(db):
+    assert bikidata.fts_analyze("The Night Watch", stemmer=None) == ["the", "night", "watch"]
+    assert bikidata.fts_analyze("The Night Watch") == ["the", "night", "watch"]
+    assert bikidata.fts_analyze("R\u00e4uber Stra\u00dfe", fold="german", stemmer=None) == [
+        "raeuber",
+        "strasse",
+    ]
+
+
+def test_index_settings_record_the_analyzer(db):
+    bikidata.build_fts(db, stemmer="german", fold="german")
+    with open(os.path.join(fts_index_path(db), SETTINGS_FILE)) as f:
+        settings = json.load(f)
+    assert settings["stemmer"] == "german"
+    assert settings["fold"] == "german"
+    assert settings["normalizer"] == "NFC"
+    assert settings["tokenizer"] == "simple"
+    assert "stemmer:german" in settings["filters"]
+    assert isinstance(settings["built"], float)
+    assert settings["bikidata_version"]
+    assert settings["tantivy_version"]
+    # The search of the just built index uses the settings that were recorded
+    assert f"<{EX}GermanThing>" in dict(bikidata.fts_search("raeuber", db_path=db))
+
+
+def test_normalizer_hook(db):
+    bikidata.build_fts(db, stemmer=None, normalizer=historical_normalizer)
+    assert (
+        bikidata.fts_analyze("M\u00fcller", stemmer=None, normalizer=historical_normalizer)
+        == ["muller"]
+    )
+    assert (
+        f"<{EX}NfdThing>" in dict(bikidata.fts_search("muller", db_path=db, normalizer=historical_normalizer))
+    )
 
 
 def test_rebuild_and_stemmer(db):

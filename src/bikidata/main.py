@@ -19,6 +19,13 @@ handler.setFormatter(formatter)
 DB_PATH = os.getenv("BIKIDATA_DB", "bikidata.duckdb")
 log.debug(f"BIKIDATA_DB is configured as {DB_PATH}")
 
+try:
+    from importlib.metadata import version as _package_version
+
+    BIKIDATA_VERSION = _package_version("bikidata")
+except Exception:
+    BIKIDATA_VERSION = "0.4"
+
 
 def literal_to_parts(literal: str):
     literal_value = language = datatype = None

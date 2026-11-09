@@ -23,14 +23,15 @@ heavy lifting out-of-core:
        one Tantivy document per subject
 """
 
-import json, os, re, shutil, time
+import json, os, re, shutil, time, unicodedata
 import duckdb
 import pandas as pd
 import tantivy
 import xxhash
+from typing import Callable
 
 from . import main
-from .main import log
+from .main import BIKIDATA_VERSION, log
 from .sparql_engine import nt_unescape
 
 PRIMARY_LABEL_IRIS = {
@@ -57,8 +58,95 @@ SETTINGS_FILE = "bikidata_fts.json"
 MAX_LABEL_LENGTH = 150
 MAX_LITERAL_LENGTH = 50_000
 
+UNICORN_FORM = "NFC"
+DEFAULT_FOLD = None
+DEFAULT_STEMMER = "porter"
+
 # The stemmer names of the DuckDB FTS extension that differ from Tantivy's
 STEMMER_ALIASES = {"porter": "english", "none": None, "": None}
+
+# The German folding, applied before the ASCII folding filter of the analyzer:
+# ä→ae, ö→oe, ü→ue, and ß→ss, also for the capitals, so that a German text and
+# its folded form are tokenized into the same terms.
+GERMAN_FOLD = str.maketrans({
+    "ä": "ae",
+    "ö": "oe",
+    "ü": "ue",
+    "ß": "ss",
+    "Ä": "ae",
+    "Ö": "oe",
+    "Ü": "ue",
+    "ẞ": "ss",
+})
+
+
+def _nfc(text: str) -> str:
+    return unicodedata.normalize(UNICORN_FORM, text)
+
+
+def normalize_text(text: str, normalizer: Callable[[str], str] | None = None) -> str:
+    """Apply an optional project-specific normalizer hook, then the Unicode
+    normalization form (by default NFC) that the full-text index uses."""
+    if normalizer is not None:
+        text = normalizer(text)
+    return _nfc(text)
+
+
+def fold_text(text: str, fold: str | None) -> str:
+    """Apply the optional text folding before tokenization, for example the
+    German folding that maps ä→ae, ö→oe, ü→ue, and ß→ss (and the capitals)."""
+    if not fold or fold in ("none", "None", ""):
+        return text
+    if fold != "german":
+        raise ValueError(f"Unsupported fold option {fold!r}, expected 'german' or None")
+    return text.translate(GERMAN_FOLD)
+
+
+def prepare_text(
+    text: str, normalizer: Callable[[str], str] | None = None, fold: str | None = None
+) -> str:
+    """Normalize and fold a text before it is tokenized, indexed or queried."""
+    return fold_text(normalize_text(text, normalizer), fold)
+
+
+def _normalizer_from_settings(name) -> Callable[[str], str] | None:
+    """Resolve the normalizer recorded in the index settings back into a
+    callable, defaulting to the Unicode normalization form."""
+    if not name or name == UNICORN_FORM or name == "none":
+        return _nfc
+    module_name, _, qualname = str(name).rpartition(".")
+    if not module_name:
+        return _nfc
+    try:
+        module = __import__(module_name, fromlist=["*"])
+        obj: object = module
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+        if callable(obj):
+            return obj
+    except Exception:
+        log.debug(
+            f"Could not resolve the normalizer {name} of the full-text index, using {UNICORN_FORM}"
+        )
+    return _nfc
+
+
+def _fts_settings(stemmer: str | None, fold: str | None, normalizer: str) -> dict:
+    """The full text analysis configuration of the index, recorded in
+    bikidata_fts.json for provenance with every (re)build of the index."""
+    filters = ["remove_long:40", "lowercase", "ascii_fold"]
+    if stemmer:
+        filters.append(f"stemmer:{stemmer}")
+    return {
+        "stemmer": stemmer,
+        "built": time.time(),
+        "normalizer": normalizer,
+        "fold": fold,
+        "tokenizer": "simple",
+        "filters": filters,
+        "bikidata_version": BIKIDATA_VERSION,
+        "tantivy_version": str(getattr(tantivy, "__version__", "unknown")),
+    }
 
 
 class FTSIndexMissing(Exception):
@@ -129,9 +217,37 @@ def build_fts(
     max_vals_per_pred: int = 100,
     heap_size: int = 256_000_000,
     db_connection=None,
+    fold: str | None = None,
+    normalizer: Callable[[str], str] | None = None,
 ) -> dict:
     """(Re)build the full-text index for the database at db_path.
     Pass db_connection to use an already open connection to the database.
+
+    stemmer is the stemming filter to apply, for example "porter" (the default,
+    aliased to the English stemmer of Tantivy), "german", or None for no stemming.
+    fold optionally folds the text before tokenization, for example "german"
+    maps ä→ae, ö→oe, ü→ue, and ß→ss (and the capitals) before the ASCII folding
+    filter of the analyzer, so that an indexed German label like "Räuber" and a
+    query like "raeuber" are tokenized into the same term. None (the default)
+    keeps the text as is, and the Unicode normalization form (default NFC) is
+    always applied before tokenization.
+
+    Args:
+        db_path: the DuckDB database to index, when building a new index.
+        index_path: the directory of the Tantivy index, defaults next to the database.
+        stemmer: the stemming filter to apply, "porter" (default, aliased to the
+            English stemmer), "german", or None for no stemming.
+        max_bnode_depth: how deep to unroll blank nodes when indexing.
+        max_vals_per_pred: maximum number of values indexed per predicate.
+        heap_size: the heap size of the Tantivy index writer.
+        db_connection: use an already open database connection instead of opening one.
+        fold: optional text folding before tokenization, for example "german"
+            maps ä→ae, ö→oe, ü→ue, and ß→ss (and the capitals) before the ASCII
+            folding filter, so that "Räuber" and "raeuber" are tokenized alike.
+            None (the default) keeps the text as is.
+        normalizer: optional project-specific text normalization hook, applied to
+            every literal before indexing and to every query before parsing, before
+            the Unicode normalization form (default NFC) is applied.
     """
     start_time = time.time()
     index_path = index_path or fts_index_path(db_path)
@@ -154,23 +270,34 @@ def build_fts(
     cursor = con.cursor()
     try:
         count = _index_entities(
-            cursor, index, max_bnode_depth, max_vals_per_pred, heap_size
+            cursor, index, max_bnode_depth, max_vals_per_pred, heap_size, normalizer, fold
         )
     finally:
         cursor.close()
         if db_connection is None:
             con.close()
 
-    # Written last, it marks the index as complete
+    # Written last, it marks the index as complete, and records the full text analysis
     with open(os.path.join(index_path, SETTINGS_FILE), "w") as f:
-        json.dump({"stemmer": stemmer, "built": time.time()}, f)
+        json.dump(
+            _fts_settings(
+                stemmer,
+                fold,
+                normalizer.__module__ + "." + normalizer.__qualname__
+                if normalizer is not None
+                else UNICORN_FORM,
+            ),
+            f,
+        )
 
     duration = int(time.time() - start_time)
     log.debug(f"Full-text index with {count} entities built in {duration}s")
     return {"duration": duration, "count": count}
 
 
-def _index_entities(cursor, index, max_bnode_depth, max_vals_per_pred, heap_size):
+def _index_entities(
+    cursor, index, max_bnode_depth, max_vals_per_pred, heap_size, normalizer=None, fold=None
+):
     # Pass 1: the best label of each IRI, preferring @en, then untagged literals
     predicates = cursor.execute(
         "select I.value, P.p from (select distinct p from triples) P join iris I on I.hash = P.p"
@@ -235,7 +362,13 @@ def _index_entities(cursor, index, max_bnode_depth, max_vals_per_pred, heap_size
                 if current is not None:
                     writer.add_document(
                         _entity_doc(
-                            subject, edges, label_preds, type_preds, max_vals_per_pred
+                            subject,
+                            edges,
+                            label_preds,
+                            type_preds,
+                            max_vals_per_pred,
+                            normalizer,
+                            fold,
                         )
                     )
                     count += 1
@@ -243,7 +376,9 @@ def _index_entities(cursor, index, max_bnode_depth, max_vals_per_pred, heap_size
             edges.append((p, literal, iri, label))
     if current is not None:
         writer.add_document(
-            _entity_doc(subject, edges, label_preds, type_preds, max_vals_per_pred)
+            _entity_doc(
+                subject, edges, label_preds, type_preds, max_vals_per_pred, normalizer, fold
+            )
         )
         count += 1
     writer.commit()
@@ -251,7 +386,9 @@ def _index_entities(cursor, index, max_bnode_depth, max_vals_per_pred, heap_size
     return count
 
 
-def _entity_doc(subject, edges, label_preds, type_preds, max_vals_per_pred):
+def _entity_doc(
+    subject, edges, label_preds, type_preds, max_vals_per_pred, normalizer=None, fold=None
+):
     titles, literals, related = [], [], []
     by_pred = {}
     pred_counts = {}
@@ -263,7 +400,7 @@ def _entity_doc(subject, edges, label_preds, type_preds, max_vals_per_pred):
             continue
 
         if literal is not None:
-            val = lexical_form(literal).strip()
+            val = prepare_text(lexical_form(literal), normalizer, fold).strip()
             if not val or len(val) > MAX_LITERAL_LENGTH:
                 continue
             if p in label_preds:
@@ -272,17 +409,19 @@ def _entity_doc(subject, edges, label_preds, type_preds, max_vals_per_pred):
                 literals.append(val)
             by_pred.setdefault(f"p{p:016x}", []).append(val)
         elif iri is not None and iri.startswith("<") and p not in type_preds:
-            related.append(lexical_form(label) if label else humanize_iri(iri))
+            related.append(
+                prepare_text(lexical_form(label) if label else humanize_iri(iri), normalizer, fold)
+            )
 
     doc = tantivy.Document()
     doc.add_text("uri", subject)
     # Entities without a label can still be found by the local name of their IRI
     for t in titles or [humanize_iri(subject)]:
-        doc.add_text("title_text", t)
+        doc.add_text("title_text", prepare_text(t, normalizer, fold))
     for lit in literals:
-        doc.add_text("literal_text", lit)
+        doc.add_text("literal_text", prepare_text(lit, normalizer, fold))
     for rel in related:
-        doc.add_text("related_text", rel)
+        doc.add_text("related_text", prepare_text(rel, normalizer, fold))
     if by_pred:
         doc.add_json("pred_text", by_pred)
     return doc
@@ -291,7 +430,7 @@ def _entity_doc(subject, edges, label_preds, type_preds, max_vals_per_pred):
 _INDEXES = {}
 
 
-def open_index(index_path: str) -> tantivy.Index:
+def _open_index(index_path: str) -> tuple[tantivy.Index, dict]:
     settings_path = os.path.join(index_path, SETTINGS_FILE)
     try:
         mtime = os.path.getmtime(settings_path)
@@ -301,13 +440,18 @@ def open_index(index_path: str) -> tantivy.Index:
         )
     cached = _INDEXES.get(index_path)
     if cached and cached[0] == mtime:
-        return cached[1]
+        return cached[1], cached[2]
     with open(settings_path) as f:
         settings = json.load(f)
     index = tantivy.Index.open(index_path)
     index.register_tokenizer(ANALYZER, _analyzer(settings.get("stemmer")))
-    _INDEXES[index_path] = (mtime, index)
-    return index
+    _INDEXES[index_path] = (mtime, index, settings)
+    return index, settings
+
+
+def open_index(index_path: str) -> tantivy.Index:
+    """Open the full-text index at index_path, for direct use."""
+    return _open_index(index_path)[0]
 
 
 def parse_fts_query(index: tantivy.Index, q: str, prop: str | None = None):
@@ -328,20 +472,54 @@ def parse_fts_query(index: tantivy.Index, q: str, prop: str | None = None):
         return query
 
 
+def fts_analyze(
+    text: str,
+    stemmer: str = DEFAULT_STEMMER,
+    fold: str | None = DEFAULT_FOLD,
+    normalizer: Callable[[str], str] | None = None,
+) -> list[str]:
+    """Return the tokens that the full-text index would store for text, as a list of
+    strings, after the Unicode normalization, the folding, the tokenization, the
+    filters and the stemming. Clients can use this to check that their own
+    normalization of a text matches the normalization of the index, and tests can
+    become simple.
+
+    stemmer: the stemming filter to apply, "porter" (default, aliased to the English
+        stemmer), "german", or None for no stemming.
+    fold: optional text folding before tokenization, for example "german".
+    normalizer: optional project-specific text normalization hook.
+    """
+    if not text or not text.strip():
+        return []
+    the_stemmer = STEMMER_ALIASES.get(stemmer, stemmer)
+    analyzer = _analyzer(the_stemmer)
+    return list(analyzer.analyze(prepare_text(text, normalizer=normalizer, fold=fold)))
+
+
 def fts_search(
     q: str,
     prop: str | None = None,
     size: int | None = None,
     db_path: str | None = None,
     index_path: str | None = None,
+    fold: str | None = None,
+    normalizer: Callable[[str], str] | None = None,
 ) -> list[tuple[str, float]]:
     """Search the full-text index, returns a list of (entity, score) tuples,
-    best matches first. When size is None, all the matches are returned."""
+    best matches first. When size is None, all the matches are returned.
+
+    The query is normalized, with the optional project-specific normalizer, then the
+    Unicode normalization form (default NFC), then the optional folding, before it is
+    parsed, so that decomposed or folded queries find the same terms as the indexed
+    literals."""
     if not q or not q.strip():
         return []
-    index = open_index(index_path or fts_index_path(db_path))
+    index, settings = _open_index(index_path or fts_index_path(db_path))
+    the_fold = fold if fold is not None else settings.get("fold")
+    the_normalizer = normalizer or _normalizer_from_settings(settings.get("normalizer"))
+    prepared = fold_text(normalize_text(q, the_normalizer), the_fold)
     searcher = index.searcher()
-    query = parse_fts_query(index, q, prop)
+    query = parse_fts_query(index, prepared, prop)
     if size is None:
         size = searcher.search(query, limit=1, count=True).count
         if size == 0:

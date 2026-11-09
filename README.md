@@ -115,6 +115,46 @@ bikidata.fts_search("rembrandt", size=10)  # [(entity, score), ...]
 
 Note that the index is not updated by `insert_async` and `delete_async`, rebuild it with `build_fts` after changes.
 
+### Text analysis of the index and of the queries
+
+Before a text is tokenized into the terms of the index, and before a query is parsed into terms, the following steps
+are applied:
+
+- **Unicode normalization**: every literal is normalized to NFC (`unicodedata.normalize("NFC", ...)`) before it is
+  indexed, and every query is normalized before it is parsed, so that a decomposed (NFD) name with a diacritic is found
+  through its composed (NFC) form, no matter how the data source encoded it. This is always on, it is the default of the
+  index, and it is recorded in the settings of the index.
+- **Folding**: optionally, with `build_fts(fold="german")`, the text is folded before tokenization, mapping
+  ä→ae, ö→oe, ü→ue, and ß→ss (and the capitals) before the ASCII folding, so that German texts are matched without
+  umlauts, for example a German label like `Räuber` is found through the query `raeuber`. The default is no folding.
+- **Normalization hook**: optionally, with `build_fts(normalizer=my_normalizer)`, a project-specific Python callable is
+  applied to every literal before indexing and to every query before parsing, before the Unicode normalization form
+  (default NFC) is applied, for example for historical spelling rules.
+- **Tokenizer and filters**: the text is tokenized with the `simple` tokenizer, with the filters
+  `remove_long:40`, `lowercase`, and `ascii_fold`, and optionally the stemming filter.
+- **Stemming**: with `build_fts(stemmer=...)`, for example `build_fts(stemmer="german")`. The default is `"porter"`,
+  aliased to the English stemmer of Tantivy, and passing `stemmer="none"` disables stemming. The installed Tantivy
+  supports the German stemmer, which merges inflections, for example `lied`/`lieder` and `werk`/`werken` both stem to
+  `lied` and `werk`, where the English porter stemmer would not merge them. Choose the stemmer that fits the language of
+  your dataset, or `none` for a keyword search.
+
+To see the tokens that the index would store for a text, use `bikidata.fts_analyze(text, ...)`, which returns the list of
+tokens after normalization, folding, tokenization, filters, and stemming, for example:
+
+```python
+import bikidata
+bikidata.fts_analyze("The Night Watch")  # ['the', 'night', 'watch']
+bikidata.fts_analyze("Räuber Straße", fold="german", stemmer=None)  # ['raeuber', 'strasse']
+```
+
+Clients can use `fts_analyze` to check that their own normalization of a text matches the normalization of the index,
+and tests can become simple.
+
+The full text analysis configuration that was used for a given index is recorded in the `bikidata_fts.json` file in the
+index directory, next to the Tantivy index, for provenance with every (re)build: besides the `stemmer` and the `built`
+timestamp, it records the Unicode normalization form, the folding, the tokenizer, the filters, the bikidata version, and
+the Tantivy version.
+
 # SPARQL queries
 
 Next to the JSON queries, the data can also be queried with [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/).
