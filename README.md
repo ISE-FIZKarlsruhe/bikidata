@@ -131,12 +131,20 @@ are applied:
   applied to every literal before indexing and to every query before parsing, before the Unicode normalization form
   (default NFC) is applied, for example for historical spelling rules.
 - **Tokenizer and filters**: the text is tokenized with the `simple` tokenizer, with the filters
-  `remove_long:40`, `lowercase`, and `ascii_fold`, and optionally the stemming filter.
+  `remove_long:40`, `lowercase`, and `ascii_fold`, and optionally the stemming filter, per language for the
+  language-specific fields and without stemming for the fallback fields.
 - **Stemming**: with `build_fts(stemmer=...)`, for example `build_fts(stemmer="german")`. The default is `"porter"`,
   aliased to the English stemmer of Tantivy, and passing `stemmer="none"` disables stemming. The installed Tantivy
   supports the German stemmer, which merges inflections, for example `lied`/`lieder` and `werk`/`werken` both stem to
   `lied` and `werk`, where the English porter stemmer would not merge them. Choose the stemmer that fits the language of
   your dataset, or `none` for a keyword search.
+- **Languages**: the index is multilingual, with a field per language, for example `label_de` and `text_de` for German,
+  each with its own stemming (`stem_{lang}` tokenizers), plus the unstemmed fallback fields `label_all` and `text_all`
+  for the labels and the other literals, for untagged literals and languages without a dedicated stemmer, plus the
+  `langs` field with the language tags of the indexed literals of an entity.
+
+To search a language specifically, pass the language tag to `bikidata.fts_search`, for example `lang="de"`; without a
+language the search is language-agnostic and runs across the fallback fields and all the language fields.
 
 To see the tokens that the index would store for a text, use `bikidata.fts_analyze(text, ...)`, which returns the list of
 tokens after normalization, folding, tokenization, filters, and stemming, for example:

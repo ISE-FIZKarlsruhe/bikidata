@@ -120,13 +120,13 @@ def join_parents_sql(hops: int) -> str:
     )
 
 
-def fts_hits_table(o: str, prop: str | None, fts_hits: dict) -> str:
+def fts_hits_table(o: str, prop: str | None, fts_hits: dict, lang: str | None = None) -> str:
     """Run the full-text search o, and return the name of the (s, score) table
     that query() registers with the hits. The same search is only run once."""
-    key = (o, prop)
+    key = (o, prop, lang)
     if key not in fts_hits:
         name = f"fts_hits_{len(fts_hits)}"
-        fts_hits[key] = (name, fts_hits_frame(fts_search(o, prop, db_path=DB_PATH)))
+        fts_hits[key] = (name, fts_hits_frame(fts_search(o, prop, db_path=DB_PATH, lang=lang)))
     return fts_hits[key][0]
 
 
@@ -198,9 +198,10 @@ def q_to_sql(query: dict, fts_hits: dict | None = None):
     elif p.startswith("fts"):
         # The hits are entities with a score, from the Tantivy index, see fts.py
         # An optional property restricts the search to the literals of that property
+        # An optional language restricts the search to the fields of that language
         if fts_hits is None:
             raise ValueError("fts filters need a fts_hits registry, use query()")
-        hits = fts_hits_table(o, p_property, fts_hits)
+        hits = fts_hits_table(o, p_property, fts_hits, query.get("lang"))
 
         # parents-join chain (parents >= 1 travels up to ancestors)
         joins = join_parents_sql(parents)

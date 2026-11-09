@@ -40,6 +40,9 @@ ex:Collection ex:contains ex:NightWatch .
 
 ex:Unlabelled_Thing ex:note "Müller's café" .
 
+ex:NoordWatch a ex:E22_HumanMadeObject ;
+    rdfs:label "De Nachtwacht"@nl .
+
 ex:GermanThing a ex:E22_HumanMadeObject ;
     rdfs:label "R\u00e4uber Stra\u00dfe"@de .
 
@@ -85,8 +88,10 @@ def test_blank_nodes_are_not_entities(db):
     assert [uri for uri, _ in hits] == [f"<{EX}NightWatch>"]
 
 
-def test_stemming_accents_and_escapes(db):
-    assert bikidata.fts_search("paintings", db_path=db)[0][0] == f"<{EX}NightWatch>"
+def test_accents_and_escapes_in_the_fallback_fields(db):
+    # The fallback fields are not stemmed, so the terms have to match directly,
+    # the diacritics are folded to ascii
+    assert bikidata.fts_search("painted", db_path=db)[0][0] == f"<{EX}NightWatch>"
     assert bikidata.fts_search("muller cafe", db_path=db)[0][0] == f"<{EX}Unlabelled_Thing>"
     # \n in the N-Triples literal is a newline, not the letter n glued to the next word
     assert bikidata.fts_search("for", db_path=db)
@@ -240,6 +245,7 @@ def test_index_settings_record_the_analyzer(db):
     assert isinstance(settings["built"], float)
     assert settings["bikidata_version"]
     assert settings["tantivy_version"]
+    assert settings["languages"]
     # The search of the just built index uses the settings that were recorded
     assert f"<{EX}GermanThing>" in dict(bikidata.fts_search("raeuber", db_path=db))
 
@@ -257,10 +263,21 @@ def test_normalizer_hook(db):
 
 def test_rebuild_and_stemmer(db):
     bikidata.build_fts(db, stemmer="none")
-    assert bikidata.fts_search("paintings", db_path=db) == []
-    assert bikidata.fts_search("painted", db_path=db)
+    assert bikidata.fts_search("painted", db_path=db)[0][0] == f"<{EX}NightWatch>"
+    assert bikidata.fts_search("paintings", db_path=db, lang="en") == []
     bikidata.build_fts(db)
-    assert bikidata.fts_search("paintings", db_path=db)
+    assert bikidata.fts_search("painted", db_path=db)[0][0] == f"<{EX}NightWatch>"
+    # The language-specific fields are stemmed with the Snowball stemmer of the language
+    assert bikidata.fts_analyze("Lied Lieder", lang="de") == ["lied", "lied"]
+
+
+def test_multilingual_language_specific_search(db):
+    # A Dutch label is found through the Dutch language fields
+    assert f"<{EX}NoordWatch>" in dict(bikidata.fts_search("nachtwacht", db_path=db, lang="nl"))
+    # A German label is found through the German language fields
+    assert f"<{EX}GermanThing>" in dict(bikidata.fts_search("rauber straße", db_path=db, lang="de"))
+    # A language-agnostic search goes through the fallback fields
+    assert f"<{EX}GermanThing>" in dict(bikidata.fts_search("rauber straße", db_path=db))
 
 
 def test_does_not_overwrite_other_directories(db, tmp_path):

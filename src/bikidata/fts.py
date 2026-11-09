@@ -21,6 +21,13 @@ heavy lifting out-of-core:
     2. stream all the edges of every entity, including the unrolled blank
        nodes and the labels of the linked IRIs, sorted by subject, and write
        one Tantivy document per subject
+
+The schema is multilingual: the labels and the other literals are indexed per
+language in the `label_{lang}` and `text_{lang}` fields, stemmed with the Snowball
+stemmer of that language, and in the unstemmed fallback fields `label_all` and
+`text_all`, for the labels and the other literals respectively, for untagged
+literals and languages without a dedicated stemmer. The `langs` field records
+the language tags of the indexed literals of an entity.
 """
 
 import json, os, re, shutil, time, unicodedata
@@ -50,9 +57,6 @@ TYPE_IRIS = {
     "<https://schema.org/additionalType>",
 }
 
-TEXT_FIELDS = ["title_text", "literal_text", "related_text"]
-FIELD_BOOSTS = {"title_text": 3.0, "literal_text": 1.5, "related_text": 0.7}
-
 ANALYZER = "bikidata"
 SETTINGS_FILE = "bikidata_fts.json"
 MAX_LABEL_LENGTH = 150
@@ -61,6 +65,20 @@ MAX_LITERAL_LENGTH = 50_000
 UNICORN_FORM = "NFC"
 DEFAULT_FOLD = None
 DEFAULT_STEMMER = "porter"
+
+FALLBACK_ANALYZER = "folded_nostem"
+LABEL_ALL_FIELD = "label_all"
+TEXT_ALL_FIELD = "text_all"
+
+# Maps the BCP-47 language tags of the RDF literals to the Snowball stemmer languages of Tantivy
+LANG_MAP = {
+    "en": "english",
+    "nl": "dutch",
+    "de": "german",
+    "fr": "french",
+    "es": "spanish",
+    "it": "italian",
+}
 
 # The stemmer names of the DuckDB FTS extension that differ from Tantivy's
 STEMMER_ALIASES = {"porter": "english", "none": None, "": None}
@@ -144,6 +162,7 @@ def _fts_settings(stemmer: str | None, fold: str | None, normalizer: str) -> dic
         "fold": fold,
         "tokenizer": "simple",
         "filters": filters,
+        "languages": sorted(LANG_MAP),
         "bikidata_version": BIKIDATA_VERSION,
         "tantivy_version": str(getattr(tantivy, "__version__", "unknown")),
     }
@@ -188,13 +207,32 @@ def pred_key(p: str) -> str:
     return "p" + xxhash.xxh64_hexdigest(p).lower()
 
 
-def _analyzer(stemmer: str | None) -> tantivy.TextAnalyzer:
-    builder = (
+def _base_builder() -> tantivy.TextAnalyzerBuilder:
+    return (
         tantivy.TextAnalyzerBuilder(tantivy.Tokenizer.simple())
         .filter(tantivy.Filter.remove_long(40))
         .filter(tantivy.Filter.lowercase())
         .filter(tantivy.Filter.ascii_fold())
     )
+
+
+def _base_analyzer() -> tantivy.TextAnalyzer:
+    return _base_builder().build()
+
+
+def _stemmed_analyzer(lang: str) -> tantivy.TextAnalyzer:
+    """The analyzer of a single language: simple tokenizer, filters, Snowball stemmer of the language"""
+    snowball = LANG_MAP.get(lang, lang)
+    builder = (
+        _base_builder()
+        .filter(tantivy.Filter.stopword(snowball))
+        .filter(tantivy.Filter.stemmer(snowball))
+    )
+    return builder.build()
+
+
+def _analyzer(stemmer: str | None) -> tantivy.TextAnalyzer:
+    builder = _base_builder()
     if stemmer:
         builder = builder.filter(tantivy.Filter.stemmer(stemmer))
     return builder.build()
@@ -203,8 +241,12 @@ def _analyzer(stemmer: str | None) -> tantivy.TextAnalyzer:
 def _schema() -> tantivy.Schema:
     builder = tantivy.SchemaBuilder()
     builder.add_text_field("uri", stored=True, tokenizer_name="raw")
-    for field in TEXT_FIELDS:
-        builder.add_text_field(field, stored=False, tokenizer_name=ANALYZER)
+    builder.add_text_field("langs", stored=False, tokenizer_name="raw")
+    builder.add_text_field(LABEL_ALL_FIELD, stored=False, tokenizer_name=FALLBACK_ANALYZER)
+    builder.add_text_field(TEXT_ALL_FIELD, stored=False, tokenizer_name=FALLBACK_ANALYZER)
+    for lang in sorted(LANG_MAP):
+        builder.add_text_field(f"label_{lang}", stored=False, tokenizer_name=f"stem_{lang}")
+        builder.add_text_field(f"text_{lang}", stored=False, tokenizer_name=f"stem_{lang}")
     builder.add_json_field("pred_text", stored=False, tokenizer_name=ANALYZER)
     return builder.build()
 
@@ -265,6 +307,9 @@ def build_fts(
 
     index = tantivy.Index(_schema(), path=index_path)
     index.register_tokenizer(ANALYZER, _analyzer(stemmer))
+    index.register_tokenizer(FALLBACK_ANALYZER, _base_analyzer())
+    for lang in sorted(LANG_MAP):
+        index.register_tokenizer(f"stem_{lang}", _stemmed_analyzer(lang))
 
     con = db_connection or duckdb.connect(db_path or main.DB_PATH, read_only=True)
     cursor = con.cursor()
@@ -386,12 +431,25 @@ def _index_entities(
     return count
 
 
+def literal_lang(literal: str) -> str | None:
+    """The BCP-47 language tag of an N-Triples encoded literal, without the quotes,
+    for example '"Die Nachtwacht"@de' -> 'de', '"Painted in Amsterdam"' -> None."""
+    if not literal:
+        return None
+    m = re.search(r'"([^"]*)"(?:@([A-Za-z0-9_\-]*))?', literal)
+    if not m:
+        return None
+    tag = (m.group(2) or "").split("-")[0].strip().lower()
+    return tag or None
+
+
 def _entity_doc(
     subject, edges, label_preds, type_preds, max_vals_per_pred, normalizer=None, fold=None
 ):
     titles, literals, related = [], [], []
     by_pred = {}
     pred_counts = {}
+    langs = set()
 
     for p, literal, iri, label in edges:
         # Super-node protection, cap the values indexed per predicate
@@ -403,27 +461,40 @@ def _entity_doc(
             val = prepare_text(lexical_form(literal), normalizer, fold).strip()
             if not val or len(val) > MAX_LITERAL_LENGTH:
                 continue
+            lang = literal_lang(literal)
+            if lang:
+                langs.add(lang)
             if p in label_preds:
-                titles.append(val)
+                titles.append((val, lang))
             else:
-                literals.append(val)
+                literals.append((val, lang))
             by_pred.setdefault(f"p{p:016x}", []).append(val)
         elif iri is not None and iri.startswith("<") and p not in type_preds:
-            related.append(
-                prepare_text(lexical_form(label) if label else humanize_iri(iri), normalizer, fold)
-            )
+            val = prepare_text(lexical_form(label) if label else humanize_iri(iri), normalizer, fold)
+            lang = literal_lang(label) if label else None
+            if lang:
+                langs.add(lang)
+            related.append((val, lang))
 
     doc = tantivy.Document()
     doc.add_text("uri", subject)
     # Entities without a label can still be found by the local name of their IRI
-    for t in titles or [humanize_iri(subject)]:
-        doc.add_text("title_text", prepare_text(t, normalizer, fold))
-    for lit in literals:
-        doc.add_text("literal_text", prepare_text(lit, normalizer, fold))
-    for rel in related:
-        doc.add_text("related_text", prepare_text(rel, normalizer, fold))
+    for val, lang in titles or [(prepare_text(humanize_iri(subject), normalizer, fold), None)]:
+        doc.add_text(LABEL_ALL_FIELD, val)
+        if lang and lang in LANG_MAP:
+            doc.add_text(f"label_{lang}", val)
+    for val, lang in literals:
+        doc.add_text(TEXT_ALL_FIELD, val)
+        if lang and lang in LANG_MAP:
+            doc.add_text(f"text_{lang}", val)
+    for val, lang in related:
+        doc.add_text(TEXT_ALL_FIELD, val)
+        if lang and lang in LANG_MAP:
+            doc.add_text(f"text_{lang}", val)
     if by_pred:
         doc.add_json("pred_text", by_pred)
+    if langs:
+        doc.add_text("langs", " ".join(sorted(langs)))
     return doc
 
 
@@ -445,6 +516,9 @@ def _open_index(index_path: str) -> tuple[tantivy.Index, dict]:
         settings = json.load(f)
     index = tantivy.Index.open(index_path)
     index.register_tokenizer(ANALYZER, _analyzer(settings.get("stemmer")))
+    index.register_tokenizer(FALLBACK_ANALYZER, _base_analyzer())
+    for lang in sorted(LANG_MAP):
+        index.register_tokenizer(f"stem_{lang}", _stemmed_analyzer(lang))
     _INDEXES[index_path] = (mtime, index, settings)
     return index, settings
 
@@ -454,14 +528,41 @@ def open_index(index_path: str) -> tantivy.Index:
     return _open_index(index_path)[0]
 
 
-def parse_fts_query(index: tantivy.Index, q: str, prop: str | None = None):
+def _query_fields(lang: str | None) -> tuple[list[str], dict[str, float]]:
+    """The fields to search for a language, and their boosts, for a known language
+    query and for a language-agnostic query."""
+    if lang:
+        base = str(lang).split("-")[0].strip().lower()
+        if base in LANG_MAP:
+            return (
+                [f"label_{base}", f"text_{base}", LABEL_ALL_FIELD, TEXT_ALL_FIELD],
+                {
+                    f"label_{base}": 10.0,
+                    LABEL_ALL_FIELD: 5.0,
+                    f"text_{base}": 2.0,
+                    TEXT_ALL_FIELD: 0.5,
+                },
+            )
+    fields = [LABEL_ALL_FIELD, TEXT_ALL_FIELD]
+    boosts = {LABEL_ALL_FIELD: 3.0, TEXT_ALL_FIELD: 0.5}
+    for l in sorted(LANG_MAP):
+        fields.append(f"label_{l}")
+        fields.append(f"text_{l}")
+        boosts[f"label_{l}"] = 5.0
+        boosts[f"text_{l}"] = 1.0
+    return fields, boosts
+
+
+def parse_fts_query(index: tantivy.Index, q: str, prop: str | None = None, lang: str | None = None):
     """Parse q in the Tantivy query language, all the terms have to match by default.
-    When prop is given, only the literals of that predicate are searched."""
+    When prop is given, only the literals of that predicate are searched. When lang is
+    given, only the fields of that language (and the fallback fields) are searched."""
     if prop:
         q = f"pred_text.{pred_key(prop)}:({q})"
+    fields, boosts = _query_fields(lang)
     kwargs = dict(
-        default_field_names=TEXT_FIELDS,
-        field_boosts=FIELD_BOOSTS,
+        default_field_names=fields,
+        field_boosts=boosts,
         conjunction_by_default=True,
     )
     try:
@@ -477,6 +578,7 @@ def fts_analyze(
     stemmer: str = DEFAULT_STEMMER,
     fold: str | None = DEFAULT_FOLD,
     normalizer: Callable[[str], str] | None = None,
+    lang: str | None = None,
 ) -> list[str]:
     """Return the tokens that the full-text index would store for text, as a list of
     strings, after the Unicode normalization, the folding, the tokenization, the
@@ -488,11 +590,12 @@ def fts_analyze(
         stemmer), "german", or None for no stemming.
     fold: optional text folding before tokenization, for example "german".
     normalizer: optional project-specific text normalization hook.
+    lang: optional language tag, for example "de", to use the stemming of that language.
     """
     if not text or not text.strip():
         return []
-    the_stemmer = STEMMER_ALIASES.get(stemmer, stemmer)
-    analyzer = _analyzer(the_stemmer)
+    the_stemmer = STEMMER_ALIASES.get(stemmer, stemmer) if stemmer else stemmer
+    analyzer = _stemmed_analyzer(lang) if lang else _analyzer(the_stemmer)
     return list(analyzer.analyze(prepare_text(text, normalizer=normalizer, fold=fold)))
 
 
@@ -504,6 +607,7 @@ def fts_search(
     index_path: str | None = None,
     fold: str | None = None,
     normalizer: Callable[[str], str] | None = None,
+    lang: str | None = None,
 ) -> list[tuple[str, float]]:
     """Search the full-text index, returns a list of (entity, score) tuples,
     best matches first. When size is None, all the matches are returned.
@@ -511,7 +615,8 @@ def fts_search(
     The query is normalized, with the optional project-specific normalizer, then the
     Unicode normalization form (default NFC), then the optional folding, before it is
     parsed, so that decomposed or folded queries find the same terms as the indexed
-    literals."""
+    literals. When lang is given, only the fields of that language, and the fallback
+    fields, are searched."""
     if not q or not q.strip():
         return []
     index, settings = _open_index(index_path or fts_index_path(db_path))
@@ -519,7 +624,7 @@ def fts_search(
     the_normalizer = normalizer or _normalizer_from_settings(settings.get("normalizer"))
     prepared = fold_text(normalize_text(q, the_normalizer), the_fold)
     searcher = index.searcher()
-    query = parse_fts_query(index, prepared, prop)
+    query = parse_fts_query(index, prepared, prop, lang)
     if size is None:
         size = searcher.search(query, limit=1, count=True).count
         if size == 0:
